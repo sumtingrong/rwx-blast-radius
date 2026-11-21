@@ -629,13 +629,18 @@ def main() -> None:
 
                         importers_of_rel = mod_importers.get(rel, {rel})
                         cls_kind, d_names = classify_class(cls_name) if cls_name else (None, None)
+
+                        def tests_for_reader_loc(r_rel: str, r_ln: int) -> set[int]:
+                            direct = get_line_tests(r_rel, r_ln)
+                            return direct if direct else tests_for_line_or_span(r_rel, r_ln)
+
                         if d_names is not None:
                             if reader_locs:
                                 matched = set()
                                 for loc in reader_locs:
                                     r_rel, r_ln_str = loc.rsplit(":", 1)
                                     r_ln = int(r_ln_str)
-                                    t_here = tests_for_line_or_span(r_rel, r_ln)
+                                    t_here = tests_for_reader_loc(r_rel, r_ln)
                                     if t_here:
                                         matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
                                 selected.update(matched)
@@ -648,7 +653,7 @@ def main() -> None:
                         elif reader_locs:
                             for loc in reader_locs:
                                 r_rel, r_ln_str = loc.rsplit(":", 1)
-                                selected.update(tests_for_line_or_span(r_rel, int(r_ln_str)))
+                                selected.update(tests_for_reader_loc(r_rel, int(r_ln_str)))
                             if attr_name:
                                 mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
                                 if is_expr_class_attr and cls_name:

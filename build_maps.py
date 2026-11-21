@@ -22,14 +22,6 @@ from concurrent.futures import Future
 from pathlib import Path
 
 
-def _yield_bool_leaves(expr: ast.AST):
-    if isinstance(expr, ast.BoolOp):
-        for v in expr.values:
-            yield from _yield_bool_leaves(v)
-    else:
-        yield (expr.lineno, expr.end_lineno or expr.lineno, expr)
-
-
 def iter_stmt_spans(node: ast.AST):
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -38,12 +30,7 @@ def iter_stmt_spans(node: ast.AST):
             yield from iter_stmt_spans(child)
         elif isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
             if isinstance(child, (ast.If, ast.While)):
-                if isinstance(child.test, ast.BoolOp):
-                    first_leaf = next(_yield_bool_leaves(child.test))
-                    yield (child.lineno, max(child.lineno, first_leaf[1]), child)
-                    yield from _yield_bool_leaves(child.test)
-                else:
-                    yield (child.lineno, child.test.end_lineno or child.lineno, child)
+                yield (child.lineno, child.test.end_lineno or child.lineno, child)
             elif isinstance(child, (ast.For, ast.AsyncFor)):
                 yield (child.lineno, child.iter.end_lineno or child.lineno, child)
             else:

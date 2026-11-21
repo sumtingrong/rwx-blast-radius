@@ -25,7 +25,6 @@ from concurrent.futures import Future
 from pathlib import Path
 
 DERIVED_SOURCE_ATTRS = frozenset({
-    "TRANSFORMS",
     "COERCES_TO",
     "TIME_MAPPING",
     "FORMAT_MAPPING",
@@ -504,7 +503,7 @@ def _collect_static_targets(repo_root: Path) -> set[str]:
                                         dict_attrs.add(nm)
                                     else:
                                         attrs.add(nm)
-    return attrs - dict_attrs - DERIVED_SOURCE_ATTRS - tok_names - {"NUMERIC_ESCAPES", "KEYWORDS", "SINGLE_TOKENS"}
+    return attrs - dict_attrs - DERIVED_SOURCE_ATTRS - tok_names - {"NUMERIC_ESCAPES", "KEYWORDS", "SINGLE_TOKENS", "TRANSFORMS"}
 
 
 class _WorkerASTTransformer(ast.NodeTransformer):
@@ -594,10 +593,60 @@ class _WorkerASTTransformer(ast.NodeTransformer):
                     return ast.copy_location(call, node)
         return node
 
+    def _wrap_bool_test(self, node: ast.AST) -> ast.AST:
+        if isinstance(node, ast.BoolOp):
+            node.values = [self._wrap_bool_test(v) for v in node.values]
+            return node
+        if (
+            isinstance(node, (ast.Constant, ast.Compare))
+            or (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not))
+            or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id.startswith("_blast_"))
+        ):
+            return node
+        sid = len(self.sites)
+        self.sites.append((self.rel, node.lineno, node.col_offset, "BoolNone"))
+        call = ast.Call(
+            func=ast.Name(id="_blast_bool_none", ctx=ast.Load()),
+            args=[ast.Constant(sid), node],
+            keywords=[],
+        )
+        return ast.copy_location(call, node)
+
+    def visit_If(self, node: ast.If):
+        self.generic_visit(node)
+        node.test = self._wrap_bool_test(node.test)
+        return node
+
+    def visit_While(self, node: ast.While):
+        self.generic_visit(node)
+        node.test = self._wrap_bool_test(node.test)
+        return node
+
+    def visit_IfExp(self, node: ast.IfExp):
+        self.generic_visit(node)
+        node.test = self._wrap_bool_test(node.test)
+        return node
+
+    def visit_Assert(self, node: ast.Assert):
+        self.generic_visit(node)
+        node.test = self._wrap_bool_test(node.test)
+        return node
+
+    def visit_comprehension(self, node: ast.comprehension):
+        self.generic_visit(node)
+        node.ifs = [self._wrap_bool_test(c) for c in node.ifs]
+        return node
+
+    def visit_UnaryOp(self, node: ast.UnaryOp):
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Not):
+            node.operand = self._wrap_bool_test(node.operand)
+        return node
+
 
 def _trace_worker(args):
     repo_root_str, file_list, scalar_attrs = args
-    repo_root = Path(repo_root_str)
+    repo_root = Path(repo_root_str).resolve()
     os.environ["SKIP_INTEGRATION"] = "0"
     sys.path.insert(0, str(repo_root))
     _install_shims_if_needed()
@@ -606,6 +655,8 @@ def _trace_worker(args):
     sites: list[tuple[str, int, int, str]] = []
     cur_bad: set[int] = set()
     cls_bad: set[int] = set()
+    cur_falsy: set[int] = set()
+    cls_falsy: set[int] = set()
     cur_dict_hits: set[tuple[str, str, str]] = set()
     cls_dict_hits: set[tuple[str, str, str]] = set()
     cur_attr_hits: set[tuple[str, str]] = set()
@@ -634,6 +685,13 @@ def _trace_worker(args):
                             dst.add(sid)
                     except Exception:
                         dst.add(sid)
+            f_dst = cur_falsy if not in_setup else cls_falsy
+            if sid not in f_dst:
+                try:
+                    if not l:
+                        f_dst.add(sid)
+                except Exception:
+                    f_dst.add(sid)
         return False
 
     def _cmp_is_not_none(sid, l):
@@ -650,7 +708,31 @@ def _trace_worker(args):
                             dst.add(sid)
                     except Exception:
                         dst.add(sid)
+            f_dst = cur_falsy if not in_setup else cls_falsy
+            if sid not in f_dst:
+                try:
+                    if not l:
+                        f_dst.add(sid)
+                except Exception:
+                    f_dst.add(sid)
         return True
+
+    def _cmp_bool_none(sid, val):
+        if val is None:
+            return False
+        try:
+            if val:
+                return True
+        except Exception:
+            if active_cmp:
+                f_dst = cur_falsy if not in_setup else cls_falsy
+                f_dst.add(sid)
+            raise
+        if active_cmp:
+            f_dst = cur_falsy if not in_setup else cls_falsy
+            if sid not in f_dst:
+                f_dst.add(sid)
+        return False
 
     def _cmp_is(sid, l, r):
         res = l is r
@@ -794,6 +876,7 @@ def _trace_worker(args):
     builtins.__dict__["_blast_cmp_LtE"] = _cmp_lte
     builtins.__dict__["_blast_cmp_Gt"] = _cmp_gt
     builtins.__dict__["_blast_cmp_GtE"] = _cmp_gte
+    builtins.__dict__["_blast_bool_none"] = _cmp_bool_none
     builtins.__dict__["_blast_getattr"] = _tracked_getattr
 
     class _BlastFinder(importlib.abc.MetaPathFinder):
@@ -838,14 +921,15 @@ def _trace_worker(args):
     _preimport_all_dialects()
 
     sqlglot_root = str((repo_root / "sqlglot").resolve())
+    tests_root = str((repo_root / "tests").resolve())
     fixtures_root = str((repo_root / "tests" / "fixtures").resolve())
 
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.tokens import Tokenizer
     from sqlglot.parser import Parser
-    from sqlglot.generator import Generator
+    from sqlglot.generator import Generator, _DISPATCH_CACHE
 
-    # Wrap eligible uppercase class dicts AFTER pre-importing dialects
+    # Wrap eligible uppercase class dicts and Generator._DISPATCH_CACHE AFTER pre-importing dialects
     from sqlglot.dialects.dialect import Dialects
     wrapped_ids: dict[int, TrackedDict] = {}
     all_classes: set[type] = set()
@@ -882,6 +966,16 @@ def _trace_worker(args):
                 for mcls in root.__mro__:
                     if mcls is not object:
                         all_classes.add(mcls)
+    for base in (Tokenizer, Parser, Generator):
+        st = [base]
+        while st:
+            c = st.pop()
+            for mcls in c.__mro__:
+                if mcls is not object:
+                    all_classes.add(mcls)
+            for sub in c.__subclasses__():
+                if sub.__module__.startswith("sqlglot."):
+                    st.append(sub)
     for cls in sorted(all_classes, key=lambda c: c.__qualname__):
         for k, v in list(cls.__dict__.items()):
             if not k.startswith("_") and k.isupper() and type(v) is dict and k not in DERIVED_SOURCE_ATTRS:
@@ -890,6 +984,14 @@ def _trace_worker(args):
                     td = TrackedDict(v, (cls.__qualname__, k))
                     wrapped_ids[id(v)] = td
                 setattr(cls, k, td)
+
+    for g_cls, d_map in list(_DISPATCH_CACHE.items()):
+        if type(d_map) is dict:
+            td = wrapped_ids.get(id(d_map))
+            if td is None:
+                td = TrackedDict(d_map, (g_cls.__qualname__, "TRANSFORMS"))
+                wrapped_ids[id(d_map)] = td
+            _DISPATCH_CACHE[g_cls] = td
 
     TrackedDict._rec_fn = rec_dict
 
@@ -953,6 +1055,16 @@ def _trace_worker(args):
 
     def tracked_gen_init(self, *a, **kw):
         orig_gen_init(self, *a, **kw)
+        cls_self = type(self)
+        if not isinstance(self._dispatch, TrackedDict):
+            if cls_self.__module__.startswith("tests."):
+                b = _first_sqlglot_base(cls_self)
+                if b is not None and (active_test or in_setup):
+                    self._dispatch = TrackedDict(self._dispatch, (b.__qualname__, "TRANSFORMS"))
+            elif cls_self in _DISPATCH_CACHE and type(_DISPATCH_CACHE[cls_self]) is dict:
+                td = TrackedDict(_DISPATCH_CACHE[cls_self], (cls_self.__qualname__, "TRANSFORMS"))
+                _DISPATCH_CACHE[cls_self] = td
+                self._dispatch = td
         dn = type(self.dialect).__name__
         rec_set(current_dialects, class_dialects, dn)
         rec_set(current_gen_init, class_gen_init, dn)
@@ -997,23 +1109,32 @@ def _trace_worker(args):
     gzip.open = wrapped_gzip_open
 
     current_lines: set[tuple[str, int]] = set()
-    code_rel_cache: dict = {}
+    file_rel_cache: dict[str, tuple[str, bool] | None] = {}
 
-    def get_rel_for_code(filename: str) -> str | None:
-        res = code_rel_cache.get(filename)
-        if res is not None:
-            return res if res != "" else None
-        try:
-            ap = os.path.abspath(filename)
-        except Exception:
-            code_rel_cache[filename] = ""
+    def get_rel_for_code(code) -> str | None:
+        filename = code.co_filename
+        entry = file_rel_cache.get(filename)
+        if entry is None:
+            if filename in file_rel_cache:
+                return None
+            try:
+                ap = os.path.abspath(filename)
+            except Exception:
+                file_rel_cache[filename] = None
+                return None
+            if ap.endswith(".py") and (ap.startswith(sqlglot_root + os.sep) or ap.startswith(sqlglot_root + "/")):
+                entry = (Path(ap).relative_to(repo_root).as_posix(), False)
+                file_rel_cache[filename] = entry
+            elif ap.endswith(".py") and (ap.startswith(tests_root + os.sep) or ap.startswith(tests_root + "/")):
+                entry = (Path(ap).relative_to(repo_root).as_posix(), True)
+                file_rel_cache[filename] = entry
+            else:
+                file_rel_cache[filename] = None
+                return None
+        rel, is_test_dir = entry
+        if is_test_dir and (code.co_name.startswith("test_") or code.co_name == "<module>"):
             return None
-        if (ap.startswith(sqlglot_root + os.sep) or ap.startswith(sqlglot_root + "/")) and ap.endswith(".py"):
-            rel = Path(ap).relative_to(repo_root).as_posix()
-            code_rel_cache[filename] = rel
-            return rel
-        code_rel_cache[filename] = ""
-        return None
+        return rel
 
     use_monitoring = hasattr(sys, "monitoring")
     if use_monitoring:
@@ -1022,14 +1143,14 @@ def _trace_worker(args):
         mon.use_tool_id(TOOL_ID, "blast_cov")
 
         def on_py_start(code, offset):
-            rel = get_rel_for_code(code.co_filename)
+            rel = get_rel_for_code(code)
             if rel is not None:
                 mon.set_local_events(TOOL_ID, code, mon.events.LINE)
             return mon.DISABLE
 
         def on_line(code, lineno):
             if active_test:
-                rel = get_rel_for_code(code.co_filename)
+                rel = get_rel_for_code(code)
                 if rel is not None:
                     current_lines.add((rel, lineno))
             return mon.DISABLE
@@ -1047,14 +1168,14 @@ def _trace_worker(args):
                 if (trace_hits & 4095) == 0 and time.monotonic() > trace_deadline:
                     sys.settrace(None)
                     return None
-                rel = get_rel_for_code(frame.f_code.co_filename)
+                rel = get_rel_for_code(frame.f_code)
                 if rel is not None:
                     current_lines.add((rel, frame.f_lineno))
             return trace_lines
 
         def trace_fn(frame, event, arg):
             if event == "call" and active_test:
-                rel = get_rel_for_code(frame.f_code.co_filename)
+                rel = get_rel_for_code(frame.f_code)
                 if rel is not None:
                     return trace_lines
             return None
@@ -1082,6 +1203,7 @@ def _trace_worker(args):
             class_gen_init.clear()
             class_gen_sql.clear()
             cls_bad.clear()
+            cls_falsy.clear()
             cls_dict_hits.clear()
             cls_attr_hits.clear()
             active_test = False
@@ -1101,6 +1223,7 @@ def _trace_worker(args):
             saved_class_gen_init = set(class_gen_init)
             saved_class_gen_sql = set(class_gen_sql)
             saved_bad = set(cls_bad)
+            saved_falsy = set(cls_falsy)
             saved_dict_hits = set(cls_dict_hits)
             saved_attr_hits = set(cls_attr_hits)
 
@@ -1114,6 +1237,7 @@ def _trace_worker(args):
                 current_gen_init.clear()
                 current_gen_sql.clear()
                 cur_bad.clear()
+                cur_falsy.clear()
                 cur_dict_hits.clear()
                 cur_attr_hits.clear()
                 inst = cls(meth_name)
@@ -1160,6 +1284,7 @@ def _trace_worker(args):
                     [f"{r}:{ln}:{col}:{op}" for (r, ln, col, op) in (sites[s] for s in (cur_bad | saved_bad))],
                     [f"{c}|{a}|{k}" for (c, a, k) in (cur_dict_hits | saved_dict_hits)],
                     [f"{d}|{a}" for (d, a) in (cur_attr_hits | saved_attr_hits)],
+                    [f"{r}:{ln}:{col}:{op}" for (r, ln, col, op) in (sites[s] for s in (cur_falsy | saved_falsy))],
                 ))
 
             if hasattr(cls, "tearDownClass"):
@@ -1209,11 +1334,12 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
     gen_init_to_idxs = defaultdict(set)
     gen_sql_to_idxs = defaultdict(set)
     cmp_diff_to_idxs = defaultdict(set)
+    falsy_diff_to_idxs = defaultdict(set)
     dict_key_to_idxs = defaultdict(set)
     scalar_attr_to_idxs = defaultdict(set)
 
     for wout in worker_outputs:
-        for nodeid, lines, fxs, dls, toks, parses, ginits, gsqls, cmp_bads, dict_hits, attr_hits in wout:
+        for nodeid, lines, fxs, dls, toks, parses, ginits, gsqls, cmp_bads, dict_hits, attr_hits, falsy_bads in wout:
             idx = len(nodeids)
             nodeids.append(nodeid)
             for loc in lines:
@@ -1232,6 +1358,8 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
                 gen_sql_to_idxs[gs].add(idx)
             for cb in cmp_bads:
                 cmp_diff_to_idxs[cb].add(idx)
+            for fb in falsy_bads:
+                falsy_diff_to_idxs[fb].add(idx)
             for dh in dict_hits:
                 dict_key_to_idxs[dh].add(idx)
             for ah in attr_hits:
@@ -1299,6 +1427,22 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
                         if base.__name__ not in ("Tokenizer", "JSONPathTokenizer"):
                             tokenizer_subclasses[base.__name__].add(d_name)
 
+    for base in (Tokenizer, Parser, Generator):
+        st = [base]
+        while st:
+            c = st.pop()
+            for mcls in c.__mro__:
+                if mcls is not object:
+                    all_tracked_classes.add(mcls)
+            for sub in c.__subclasses__():
+                if sub.__module__.startswith("sqlglot."):
+                    st.append(sub)
+
+    tokenizer_subclasses["Hive.Tokenizer"].add("Athena")
+    tokenizer_subclasses["Trino.Tokenizer"].add("Athena")
+    tokenizer_subclasses["_TrinoTokenizer"].add("Athena")
+    generator_subclasses["_HiveGenerator"].add("Athena")
+
     cls_sub_qualnames: dict[str, set[str]] = defaultdict(set)
     tracked_dicts: set[tuple[str, str]] = set()
     for cls in all_tracked_classes:
@@ -1309,6 +1453,9 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         for k, v in cls.__dict__.items():
             if not k.startswith("_") and k.isupper() and isinstance(v, dict) and k not in DERIVED_SOURCE_ATTRS:
                 tracked_dicts.add((cq, k))
+
+    cls_sub_qualnames["Hive.Tokenizer"].add("Athena.Tokenizer")
+    cls_sub_qualnames["Trino.Tokenizer"].add("Athena.Tokenizer")
 
     mod_to_file = {}
     file_data = {}
@@ -1349,6 +1496,22 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             for nm in info["mod_name_reads"]:
                 mod_name_readers[nm].add(rel)
         else:
+            if rel not in ("tests/gen_fixtures.py", "tests/leakcheck.py"):
+                for li in info["line_info"].values():
+                    if "class_attr" in li:
+                        cn, an = li["class_attr"]
+                        if cn:
+                            defined_symbols.add(cn)
+                            defined_symbols.add(cn.split(".")[-1])
+                        if an:
+                            defined_symbols.add(an)
+                    if "module_var" in li and li["module_var"]:
+                        defined_symbols.add(li["module_var"])
+                for nm, lns in info["name_reads"].items():
+                    for ln in lns:
+                        name_readers[nm].append(f"{rel}:{ln}")
+                for nm in info["mod_name_reads"]:
+                    mod_name_readers[nm].add(rel)
             for attr, lns in info["attr_reads"].items():
                 if attr in scalar_attrs:
                     for ln in lns:
@@ -1432,6 +1595,9 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         with open(out_path.parent / "dict_keys.pkl", "wb") as dk:
             pickle.dump(dict(dict_key_to_idxs), dk, protocol=pickle.HIGHEST_PROTOCOL)
 
+        with open(out_path.parent / "falsy_diffs.pkl", "wb") as fd:
+            pickle.dump(dict(falsy_diff_to_idxs), fd, protocol=pickle.HIGHEST_PROTOCOL)
+
         index_payload = {
             "split": True,
             "nodeids": nodeids,
@@ -1464,10 +1630,11 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             out_path.stat().st_size
             + (out_path.parent / "readers.pkl").stat().st_size
             + (out_path.parent / "dict_keys.pkl").stat().st_size
+            + (out_path.parent / "falsy_diffs.pkl").stat().st_size
             + sum(p.stat().st_size for p in meta_dir.iterdir())
         ) / 1e6
         print(
-            f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB, cmp_diffs={len(cmp_diff_to_idxs)}, dict_keys={len(dict_key_to_idxs)}, scalar_attrs={len(scalar_attr_to_idxs)}) for {len(nodeids)} tests",
+            f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB, cmp_diffs={len(cmp_diff_to_idxs)}, falsy_diffs={len(falsy_diff_to_idxs)}, dict_keys={len(dict_key_to_idxs)}, scalar_attrs={len(scalar_attr_to_idxs)}) for {len(nodeids)} tests",
             flush=True,
         )
         return

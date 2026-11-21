@@ -53,13 +53,13 @@ _SAFE_NONE_EQ_TYPES = (str, int, float, bool, list, dict, tuple, set, frozenset,
 
 
 def _key_tag(k) -> str | None:
+    tp = type(k)
+    if hasattr(k, "name") and hasattr(tp, "__members__"):
+        return f"e:{tp.__name__}.{k.name}"
     if isinstance(k, (str, int, float, bool)) or k is None:
         return f"s:{k!r}"
     if isinstance(k, type):
         return f"t:{k.__qualname__}"
-    tp = type(k)
-    if hasattr(k, "name") and hasattr(tp, "__members__"):
-        return f"e:{tp.__name__}.{k.name}"
     return None
 
 
@@ -196,15 +196,22 @@ def analyze_python_file(rel: str, src: str) -> dict:
     src_lines = src.splitlines()
 
     imports = set()
+    raw_from_imports: list[tuple[str, list[str]]] = []
+    imported_bound: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
+                imported_bound.add(alias.asname or alias.name.split(".")[0])
                 if alias.name.startswith(("sqlglot", "tests")):
                     imports.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    imported_bound.add(alias.asname or alias.name)
             for base_mod in resolve_import(mod_name, is_pkg, node.module, node.level):
                 if base_mod.startswith(("sqlglot", "tests")):
                     imports.add(base_mod)
+                    raw_from_imports.append((base_mod, [a.name for a in node.names]))
                     for alias in node.names:
                         if alias.name != "*":
                             imports.add(f"{base_mod}.{alias.name}")
@@ -353,6 +360,8 @@ def analyze_python_file(rel: str, src: str) -> dict:
         "module": mod_name,
         "ast_hash": ast_digest(tree),
         "imports": sorted(imports),
+        "raw_from_imports": raw_from_imports,
+        "imported_bound": imported_bound,
         "attr_reads": {k: sorted(v) for k, v in attr_reads.items()},
         "name_reads": {k: sorted(v) for k, v in name_reads.items()},
         "mod_attr_reads": sorted(mod_attr_reads),
@@ -425,6 +434,12 @@ def _install_shims_if_needed():
             return DummyDF()
         def df(self):
             return DummyDF()
+        def fetchall(self):
+            return []
+        def fetchone(self):
+            return None
+        def fetchmany(self, *a, **kw):
+            return []
 
     class DummyConn:
         def execute(self, *a, **kw):
@@ -593,6 +608,8 @@ class _WorkerASTTransformer(ast.NodeTransformer):
                     return ast.copy_location(call, node)
         return node
 
+    _PURE_BOOL_CALLS = frozenset({"isinstance", "issubclass", "hasattr", "any", "all", "callable"})
+
     def _wrap_bool_test(self, node: ast.AST) -> ast.AST:
         if isinstance(node, ast.BoolOp):
             node.values = [self._wrap_bool_test(v) for v in node.values]
@@ -600,7 +617,7 @@ class _WorkerASTTransformer(ast.NodeTransformer):
         if (
             isinstance(node, (ast.Constant, ast.Compare))
             or (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not))
-            or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id.startswith("_blast_"))
+            or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and (node.func.id.startswith("_blast_") or (node.func.id in self._PURE_BOOL_CALLS and not node.keywords)))
         ):
             return node
         sid = len(self.sites)
@@ -664,57 +681,74 @@ def _trace_worker(args):
     active_test = False
     active_cmp = False
     in_setup = False
+    in_probe = 0
 
     def rec_dict(tag: tuple[str, str], ktag: str):
+        if in_probe:
+            return
         if active_test or (active_cmp and not in_setup):
             cur_dict_hits.add((tag[0], tag[1], ktag))
         elif in_setup:
             cls_dict_hits.add((tag[0], tag[1], ktag))
 
     def _cmp_is_none(sid, l):
+        nonlocal in_probe
         if l is None:
             return True
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
                 t = type(l)
                 if t.__eq__ is not object.__eq__ and t not in _SAFE_NONE_EQ_TYPES:
+                    in_probe += 1
                     try:
                         eq = (l == None)
                         if type(eq) is not bool or eq:
                             dst.add(sid)
                     except Exception:
                         dst.add(sid)
+                    finally:
+                        in_probe -= 1
             f_dst = cur_falsy if not in_setup else cls_falsy
             if sid not in f_dst:
+                in_probe += 1
                 try:
                     if not l:
                         f_dst.add(sid)
                 except Exception:
                     f_dst.add(sid)
+                finally:
+                    in_probe -= 1
         return False
 
     def _cmp_is_not_none(sid, l):
+        nonlocal in_probe
         if l is None:
             return False
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
                 t = type(l)
                 if t.__eq__ is not object.__eq__ and t not in _SAFE_NONE_EQ_TYPES:
+                    in_probe += 1
                     try:
                         neq = (l != None)
                         if type(neq) is not bool or not neq:
                             dst.add(sid)
                     except Exception:
                         dst.add(sid)
+                    finally:
+                        in_probe -= 1
             f_dst = cur_falsy if not in_setup else cls_falsy
             if sid not in f_dst:
+                in_probe += 1
                 try:
                     if not l:
                         f_dst.add(sid)
                 except Exception:
                     f_dst.add(sid)
+                finally:
+                    in_probe -= 1
         return True
 
     def _cmp_bool_none(sid, val):
@@ -724,45 +758,53 @@ def _trace_worker(args):
             if val:
                 return True
         except Exception:
-            if active_cmp:
+            if active_cmp and not in_probe:
                 f_dst = cur_falsy if not in_setup else cls_falsy
                 f_dst.add(sid)
             raise
-        if active_cmp:
+        if active_cmp and not in_probe:
             f_dst = cur_falsy if not in_setup else cls_falsy
             if sid not in f_dst:
                 f_dst.add(sid)
         return False
 
     def _cmp_is(sid, l, r):
+        nonlocal in_probe
         res = l is r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
+                in_probe += 1
                 try:
                     alt = l == r
                     if type(alt) is not bool or alt is not res:
                         dst.add(sid)
                 except Exception:
                     dst.add(sid)
+                finally:
+                    in_probe -= 1
         return res
 
     def _cmp_is_not(sid, l, r):
+        nonlocal in_probe
         res = l is not r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
+                in_probe += 1
                 try:
                     alt = l != r
                     if type(alt) is not bool or alt is not res:
                         dst.add(sid)
                 except Exception:
                     dst.add(sid)
+                finally:
+                    in_probe -= 1
         return res
 
     def _cmp_eq(sid, l, r):
         res = l == r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
                 if (l is r) is not res or type(res) is not bool:
@@ -771,7 +813,7 @@ def _trace_worker(args):
 
     def _cmp_neq(sid, l, r):
         res = l != r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
                 if (l is not r) is not res or type(res) is not bool:
@@ -779,55 +821,71 @@ def _trace_worker(args):
         return res
 
     def _cmp_lt(sid, l, r):
+        nonlocal in_probe
         res = l < r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
+                in_probe += 1
                 try:
                     alt = l <= r
                     if type(alt) is not bool or alt is not res:
                         dst.add(sid)
                 except Exception:
                     dst.add(sid)
+                finally:
+                    in_probe -= 1
         return res
 
     def _cmp_lte(sid, l, r):
+        nonlocal in_probe
         res = l <= r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
+                in_probe += 1
                 try:
                     alt = l < r
                     if type(alt) is not bool or alt is not res:
                         dst.add(sid)
                 except Exception:
                     dst.add(sid)
+                finally:
+                    in_probe -= 1
         return res
 
     def _cmp_gt(sid, l, r):
+        nonlocal in_probe
         res = l > r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
+                in_probe += 1
                 try:
                     alt = l >= r
                     if type(alt) is not bool or alt is not res:
                         dst.add(sid)
                 except Exception:
                     dst.add(sid)
+                finally:
+                    in_probe -= 1
         return res
 
     def _cmp_gte(sid, l, r):
+        nonlocal in_probe
         res = l >= r
-        if active_cmp:
+        if active_cmp and not in_probe:
             dst = cur_bad if not in_setup else cls_bad
             if sid not in dst:
+                in_probe += 1
                 try:
                     alt = l > r
                     if type(alt) is not bool or alt is not res:
                         dst.add(sid)
                 except Exception:
                     dst.add(sid)
+                finally:
+                    in_probe -= 1
         return res
 
     def _first_sqlglot_base(tp):
@@ -839,31 +897,36 @@ def _trace_worker(args):
         return None
 
     def _tracked_getattr(obj, name):
+        nonlocal in_probe
         val = getattr(obj, name)
-        if active_cmp:
-            dst = cls_attr_hits if in_setup else cur_attr_hits
-            if isinstance(obj, type):
-                dst.add((obj.__qualname__, name))
-                if obj.__module__.startswith("tests."):
-                    b = _first_sqlglot_base(obj)
-                    if b is not None:
-                        dst.add((b.__qualname__, name))
-            else:
-                d = getattr(obj, "dialect", None)
-                if d is not None:
-                    dt = type(d)
-                    dst.add((dt.__name__, name))
-                    if dt.__module__.startswith("tests."):
-                        b = _first_sqlglot_base(dt)
-                        if b is not None:
-                            dst.add((b.__name__, name))
-                else:
-                    ot = type(obj)
-                    dst.add((ot.__qualname__, name))
-                    if ot.__module__.startswith("tests."):
-                        b = _first_sqlglot_base(ot)
+        if active_cmp and not in_probe:
+            in_probe += 1
+            try:
+                dst = cls_attr_hits if in_setup else cur_attr_hits
+                if isinstance(obj, type):
+                    dst.add((obj.__qualname__, name))
+                    if obj.__module__.startswith("tests."):
+                        b = _first_sqlglot_base(obj)
                         if b is not None:
                             dst.add((b.__qualname__, name))
+                else:
+                    d = getattr(obj, "dialect", None)
+                    if d is not None:
+                        dt = type(d)
+                        dst.add((dt.__name__, name))
+                        if dt.__module__.startswith("tests."):
+                            b = _first_sqlglot_base(dt)
+                            if b is not None:
+                                dst.add((b.__name__, name))
+                    else:
+                        ot = type(obj)
+                        dst.add((ot.__qualname__, name))
+                        if ot.__module__.startswith("tests."):
+                            b = _first_sqlglot_base(ot)
+                            if b is not None:
+                                dst.add((b.__qualname__, name))
+            finally:
+                in_probe -= 1
         return val
 
     builtins.__dict__["_blast_cmp_IsNone"] = _cmp_is_none
@@ -931,7 +994,6 @@ def _trace_worker(args):
 
     # Wrap eligible uppercase class dicts and Generator._DISPATCH_CACHE AFTER pre-importing dialects
     from sqlglot.dialects.dialect import Dialects
-    wrapped_ids: dict[int, TrackedDict] = {}
     all_classes: set[type] = set()
     w_seen_dialects: set[type] = set(Dialect.classes.values())
     for d in Dialects:
@@ -979,19 +1041,11 @@ def _trace_worker(args):
     for cls in sorted(all_classes, key=lambda c: c.__qualname__):
         for k, v in list(cls.__dict__.items()):
             if not k.startswith("_") and k.isupper() and type(v) is dict and k not in DERIVED_SOURCE_ATTRS:
-                td = wrapped_ids.get(id(v))
-                if td is None:
-                    td = TrackedDict(v, (cls.__qualname__, k))
-                    wrapped_ids[id(v)] = td
-                setattr(cls, k, td)
+                setattr(cls, k, TrackedDict(v, (cls.__qualname__, k)))
 
     for g_cls, d_map in list(_DISPATCH_CACHE.items()):
         if type(d_map) is dict:
-            td = wrapped_ids.get(id(d_map))
-            if td is None:
-                td = TrackedDict(d_map, (g_cls.__qualname__, "TRANSFORMS"))
-                wrapped_ids[id(d_map)] = td
-            _DISPATCH_CACHE[g_cls] = td
+            _DISPATCH_CACHE[g_cls] = TrackedDict(d_map, (g_cls.__qualname__, "TRANSFORMS"))
 
     TrackedDict._rec_fn = rec_dict
 
@@ -1206,6 +1260,7 @@ def _trace_worker(args):
             cls_falsy.clear()
             cls_dict_hits.clear()
             cls_attr_hits.clear()
+            in_probe = 0
             active_test = False
             in_setup = True
             active_cmp = True
@@ -1216,6 +1271,7 @@ def _trace_worker(args):
                     pass
             in_setup = False
             active_cmp = False
+            in_probe = 0
             saved_class_fixtures = set(class_fixtures)
             saved_class_dialects = set(class_dialects)
             saved_class_tok = set(class_tok)
@@ -1241,10 +1297,11 @@ def _trace_worker(args):
                 cur_dict_hits.clear()
                 cur_attr_hits.clear()
                 inst = cls(meth_name)
+                in_probe = 0
                 active_test = True
                 active_cmp = True
                 trace_hits = 0
-                trace_deadline = time.monotonic() + 15.0
+                trace_deadline = time.monotonic() + 120.0
                 if use_monitoring:
                     sys.monitoring.restart_events()
                 else:
@@ -1264,6 +1321,7 @@ def _trace_worker(args):
                     except Exception:
                         pass
                     active_cmp = False
+                    in_probe = 0
                 all_fx = set(current_fixtures)
                 for fx in saved_class_fixtures:
                     if cls_name == "TestExecutor":
@@ -1303,7 +1361,7 @@ def _trace_worker(args):
         sys.meta_path.remove(finder)
     builtins.open = orig_open
     gzip.open = orig_gzip_open
-    Dialect.get_or_raise = orig_get_or_raise
+    Dialect.get_or_raise = classmethod(orig_get_or_raise)
     Dialect.__init__ = orig_dialect_init
     Tokenizer.__init__ = orig_tok_init
     Parser.__init__ = orig_parse_init
@@ -1312,12 +1370,31 @@ def _trace_worker(args):
     return results
 
 
+_HEAVY_TESTS = {
+    "test_max_nodes",
+    "test_execute_tpcds",
+    "test_generator_memory",
+    "test_execute_tpch",
+    "test_optimized_tpch",
+    "test_tpcds",
+    "test_scope",
+    "test_optimize",
+    "test_simplify",
+    "test_annotate_funcs",
+    "test_recursion",
+}
+
+
 def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> None:
     items = _discover_unittest_items(repo_root)
     scalar_attrs = _collect_static_targets(repo_root)
     n_workers = workers or min(8, os.cpu_count() or 4)
     buckets_map = [defaultdict(list) for _ in range(n_workers)]
-    for i, (rel, cls_name, meth_name) in enumerate(items):
+    heavy_items = [it for it in items if it[2] in _HEAVY_TESTS]
+    light_items = [it for it in items if it[2] not in _HEAVY_TESTS]
+    for i, (rel, cls_name, meth_name) in enumerate(heavy_items):
+        buckets_map[i % n_workers][rel].append((cls_name, meth_name))
+    for i, (rel, cls_name, meth_name) in enumerate(light_items):
         buckets_map[i % n_workers][rel].append((cls_name, meth_name))
     buckets = [sorted(b.items()) for b in buckets_map if b]
 
@@ -1441,6 +1518,7 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
     tokenizer_subclasses["Hive.Tokenizer"].add("Athena")
     tokenizer_subclasses["Trino.Tokenizer"].add("Athena")
     tokenizer_subclasses["_TrinoTokenizer"].add("Athena")
+    parser_subclasses["HiveParser"].add("Athena")
     generator_subclasses["_HiveGenerator"].add("Athena")
 
     cls_sub_qualnames: dict[str, set[str]] = defaultdict(set)
@@ -1550,6 +1628,19 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
                     st.append(dep)
         file_dep_closure[rel] = seen
 
+    imported_from_file: dict[str, set[str]] = defaultdict(set)
+    for rel, info in file_data.items():
+        for base_mod, names in info["raw_from_imports"]:
+            tgt = mod_to_file.get(base_mod)
+            if tgt:
+                for n in names:
+                    imported_from_file[tgt].add("__STAR__" if n == "*" else n)
+        r_attrs = set(info["attr_reads"].keys()) | set(info["mod_attr_reads"])
+        for dep in direct_deps.get(rel, ()):
+            dep_bound = file_data[dep]["imported_bound"]
+            if dep_bound:
+                imported_from_file[dep].update(dep_bound & r_attrs)
+
     lines_by_file: dict[str, dict[int, set[int]]] = defaultdict(dict)
     file_cov_by_file: dict[str, set[int]] = defaultdict(set)
     for key, idxs in line_to_idxs.items():
@@ -1563,11 +1654,9 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         meta_dir = out_path.parent / "meta"
         meta_dir.mkdir(parents=True, exist_ok=True)
         file_ids = {}
-        ast_hashes = {}
         test_methods_map = {}
         for fid, (rel, info) in enumerate(file_data.items()):
             file_ids[rel] = fid
-            ast_hashes[rel] = info["ast_hash"]
             if info["test_methods"]:
                 test_methods_map[rel] = info["test_methods"]
             with open(meta_dir / f"{fid}.pkl", "wb") as mf:
@@ -1598,12 +1687,18 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         with open(out_path.parent / "falsy_diffs.pkl", "wb") as fd:
             pickle.dump(dict(falsy_diff_to_idxs), fd, protocol=pickle.HIGHEST_PROTOCOL)
 
+        with open(out_path.parent / "cmp_diffs.pkl", "wb") as cd:
+            pickle.dump(dict(cmp_diff_to_idxs), cd, protocol=pickle.HIGHEST_PROTOCOL)
+
+        with open(out_path.parent / "scalar_attrs.pkl", "wb") as sa:
+            pickle.dump(dict(scalar_attr_to_idxs), sa, protocol=pickle.HIGHEST_PROTOCOL)
+
         index_payload = {
             "split": True,
             "nodeids": nodeids,
             "file_ids": file_ids,
-            "ast_hashes": ast_hashes,
             "test_methods": test_methods_map,
+            "imported_from_file": {k: sorted(v) for k, v in imported_from_file.items() if v},
             "fixture_to_idxs": dict(fixture_to_idxs),
             "dialect_to_idxs": dict(dialect_to_idxs),
             "tok_to_idxs": dict(tok_to_idxs),
@@ -1618,8 +1713,6 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             "tracked_dicts": sorted(tracked_dicts),
             "test_dict_readers": dict(test_dict_readers),
             "scalar_attrs": sorted(scalar_attrs),
-            "scalar_attr_to_idxs": dict(scalar_attr_to_idxs),
-            "cmp_diff_to_idxs": dict(cmp_diff_to_idxs),
             "mod_attr_readers": {k: sorted(v) for k, v in mod_attr_readers.items()},
             "mod_name_readers": {k: sorted(v) for k, v in mod_name_readers.items()},
             "file_deps": file_dep_closure,
@@ -1631,6 +1724,8 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             + (out_path.parent / "readers.pkl").stat().st_size
             + (out_path.parent / "dict_keys.pkl").stat().st_size
             + (out_path.parent / "falsy_diffs.pkl").stat().st_size
+            + (out_path.parent / "cmp_diffs.pkl").stat().st_size
+            + (out_path.parent / "scalar_attrs.pkl").stat().st_size
             + sum(p.stat().st_size for p in meta_dir.iterdir())
         ) / 1e6
         print(

@@ -29,6 +29,70 @@ _CLASS_ANN_FILES = {
     "sqlglot/lineage.py",
     "sqlglot/optimizer/pushdown_projections.py",
 }
+_TRIE_DICT_ATTRS = frozenset({
+    "KEYWORDS",
+    "SINGLE_TOKENS",
+    "NUMERIC_ESCAPES",
+    "SHOW_PARSERS",
+    "SET_PARSERS",
+    "JODA_TIME_MAPPING",
+    "INVERSE_TIME_MAPPING",
+    "INVERSE_FORMAT_MAPPING",
+    "INVERSE_JODA_TIME_MAPPING",
+    "MYSQL_INVERSE_TIME_MAPPING",
+})
+_PURE_IMPORT_MODS = frozenset({
+    "typing",
+    "typing_extensions",
+    "collections.abc",
+    "dataclasses",
+    "enum",
+    "types",
+    "abc",
+    "re",
+    "pathlib",
+    "itertools",
+    "functools",
+    "math",
+    "inspect",
+    "warnings",
+    "contextlib",
+    "copy",
+    "datetime",
+    "decimal",
+    "fractions",
+    "json",
+    "pickle",
+    "gzip",
+    "io",
+    "os",
+    "sys",
+    "time",
+    "unittest",
+    "weakref",
+    "gc",
+    "tracemalloc",
+})
+_CORE_SQLGLOT_MODS = frozenset({
+    "sqlglot",
+    "sqlglot.expressions",
+    "sqlglot.expressions.core",
+    "sqlglot.expressions.datatypes",
+    "sqlglot.expressions.ddl",
+    "sqlglot.expressions.dml",
+    "sqlglot.expressions.functions",
+    "sqlglot.expressions.query",
+    "sqlglot.helper",
+    "sqlglot.errors",
+    "sqlglot.tokens",
+    "sqlglot.tokenizer_core",
+    "sqlglot.parser",
+    "sqlglot.generator",
+    "sqlglot.dialects.dialect",
+    "sqlglot.schema",
+    "sqlglot.time",
+    "sqlglot.trie",
+})
 REVERSIBLE_CMPS = {
     ("Is", "Eq"),
     ("Eq", "Is"),
@@ -93,11 +157,17 @@ def _is_const_none(n: ast.AST) -> bool:
     return isinstance(n, ast.Constant) and n.value is None
 
 
+_PURE_BOOL_CALLS = frozenset({"isinstance", "issubclass", "hasattr", "any", "all", "callable"})
+
+
 def _can_be_bool_none(n: ast.AST) -> bool:
-    return (
-        not isinstance(n, (ast.Compare, ast.Constant, ast.BoolOp))
-        and not (isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not))
-    )
+    if isinstance(n, (ast.Compare, ast.Constant, ast.BoolOp)):
+        return False
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+        return False
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _PURE_BOOL_CALLS and not n.keywords:
+        return False
+    return True
 
 
 def _is_type_checking(test: ast.AST) -> bool:
@@ -108,15 +178,99 @@ def _is_type_checking(test: ast.AST) -> bool:
     return False
 
 
-def _filter_tc_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
-    out = []
+def _is_docstring_stmt(s: ast.stmt) -> bool:
+    return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
+
+
+def _has_overload_decorator(s: ast.AST) -> bool:
+    if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    has_ov = False
+    for d in s.decorator_list:
+        name = d.id if isinstance(d, ast.Name) else (d.attr if isinstance(d, ast.Attribute) else None)
+        if name == "overload":
+            has_ov = True
+        elif name not in ("staticmethod", "classmethod"):
+            return False
+    return has_ov
+
+
+def _is_const_default(n: ast.AST | None) -> bool:
+    if n is None or isinstance(n, ast.Constant):
+        return True
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub, ast.Invert)):
+        return isinstance(n.operand, ast.Constant)
+    if isinstance(n, (ast.Tuple, ast.List)):
+        return all(_is_const_default(e) for e in n.elts)
+    return False
+
+
+def _is_overload_stub(s: ast.stmt, real_funcs: set[str]) -> bool:
+    if not _has_overload_decorator(s) or s.name not in real_funcs:
+        return False
+    if not all(_is_const_default(d) for d in s.args.defaults):
+        return False
+    if not all(_is_const_default(d) for d in s.args.kw_defaults):
+        return False
+    body = s.body[1:] if s.body and _is_docstring_stmt(s.body[0]) else s.body
+    if not body:
+        return True
+    if len(body) == 1:
+        b0 = body[0]
+        if isinstance(b0, ast.Pass):
+            return True
+        if isinstance(b0, ast.Expr) and isinstance(b0.value, ast.Constant) and b0.value.value is Ellipsis:
+            return True
+    return False
+
+
+def _stmts_terminate(stmts: list[ast.stmt]) -> bool:
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if isinstance(last, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+        return True
+    if isinstance(last, ast.If) and last.orelse:
+        return _stmts_terminate(_clean_stmts(last.body)) and _stmts_terminate(_clean_stmts(last.orelse))
+    return False
+
+
+def _clean_stmts(stmts: list[ast.stmt], strip_doc: bool = False, strip_overloads: bool = False) -> list[ast.stmt]:
+    if strip_doc and stmts and _is_docstring_stmt(stmts[0]):
+        stmts = stmts[1:]
+    filtered: list[ast.stmt] = []
     for s in stmts:
         if isinstance(s, ast.If) and _is_type_checking(s.test):
             if s.orelse:
-                out.extend(_filter_tc_stmts(s.orelse))
+                filtered.extend(_clean_stmts(s.orelse, strip_overloads=strip_overloads))
+        else:
+            filtered.append(s)
+
+    real_funcs = {
+        s.name
+        for s in filtered
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and not _has_overload_decorator(s)
+    } if strip_overloads else set()
+
+    out: list[ast.stmt] = []
+    for s in filtered:
+        if strip_overloads and _is_overload_stub(s, real_funcs):
+            continue
+        if isinstance(s, ast.If) and s.orelse and _stmts_terminate(_clean_stmts(s.body)):
+            s_flat = ast.If(test=s.test, body=s.body, orelse=[])
+            s_flat.lineno = s.lineno
+            s_flat.col_offset = s.col_offset
+            s_flat.end_lineno = getattr(s, "end_lineno", s.lineno)
+            s_flat.end_col_offset = getattr(s, "end_col_offset", s.col_offset)
+            out.append(s_flat)
+            out.extend(_clean_stmts(s.orelse, strip_overloads=strip_overloads))
         else:
             out.append(s)
     return out
+
+
+def _filter_tc_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
+    return _clean_stmts(stmts)
 
 
 def has_future_annotations(tree: ast.AST) -> bool:
@@ -126,9 +280,141 @@ def has_future_annotations(tree: ast.AST) -> bool:
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
             if any(al.name == "annotations" for al in node.names):
                 return True
-        elif not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+        elif not _is_docstring_stmt(node):
             break
     return False
+
+
+def _resolve_import_mod(rel: str, module: str | None, level: int) -> str | None:
+    if level == 0:
+        return module
+    if not rel:
+        return None
+    is_pkg = rel.endswith("/__init__.py")
+    mod_name = rel[:-12].replace("/", ".") if is_pkg else rel[:-3].replace("/", ".")
+    parts = mod_name.split(".") if is_pkg else mod_name.split(".")[:-1]
+    if level > 1:
+        parts = parts[: -(level - 1)]
+    base = ".".join(parts)
+    if module:
+        return f"{base}.{module}" if base else module
+    return base or None
+
+
+def _extract_imp_bindings(stmts: list[ast.stmt], rel: str):
+    bindings: dict[str, tuple[str, str]] = {}
+    imp_mods: set[str] = set()
+    for s in stmts:
+        if isinstance(s, ast.Import):
+            for a in s.names:
+                if a.name == "*":
+                    return None, None
+                bound = a.asname or a.name.split(".")[0]
+                if bound in bindings:
+                    return None, None
+                bindings[bound] = (a.name, bound)
+                imp_mods.add(a.name)
+        elif isinstance(s, ast.ImportFrom):
+            if s.module == "__future__":
+                return None, None
+            resolved = _resolve_import_mod(rel, s.module, s.level)
+            if not resolved:
+                return None, None
+            imp_mods.add(resolved)
+            for a in s.names:
+                if a.name == "*":
+                    return None, None
+                bound = a.asname or a.name
+                src_full = f"{resolved}.{a.name}"
+                if bound in bindings:
+                    return None, None
+                bindings[bound] = (resolved, a.name if s.level == 0 else src_full)
+    return bindings, imp_mods
+
+
+def _has_unsafe_dynamic(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in ("__all__", "eval", "exec", "globals", "locals"):
+            return True
+    return False
+
+
+def _collect_runtime_names(stmts: list[ast.stmt], ignore_annotations: bool, block_class_ann: bool) -> set[str]:
+    names: set[str] = set()
+
+    def walk(node: ast.AST, in_func: bool) -> None:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+            return
+        if isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                walk(dec, False)
+            for b in node.bases:
+                walk(b, False)
+            for kw in node.keywords:
+                walk(kw, False)
+            for item in _clean_stmts(node.body, strip_doc=True):
+                walk(item, False)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                walk(dec, in_func)
+            for field in ("posonlyargs", "args", "kwonlyargs"):
+                for a in getattr(node.args, field):
+                    if not ignore_annotations and a.annotation is not None:
+                        walk(a.annotation, in_func)
+            if not ignore_annotations:
+                for a in (node.args.vararg, node.args.kwarg):
+                    if a is not None and a.annotation is not None:
+                        walk(a.annotation, in_func)
+                if node.returns is not None:
+                    walk(node.returns, in_func)
+            for d in node.args.defaults:
+                walk(d, in_func)
+            for d in node.args.kw_defaults:
+                if d is not None:
+                    walk(d, in_func)
+            for item in _clean_stmts(node.body, strip_doc=True):
+                walk(item, True)
+            return
+        if isinstance(node, ast.Lambda):
+            for d in node.args.defaults:
+                walk(d, True)
+            for d in node.args.kw_defaults:
+                if d is not None:
+                    walk(d, True)
+            walk(node.body, True)
+            return
+        if isinstance(node, ast.AnnAssign):
+            walk(node.target, in_func)
+            if not (ignore_annotations and (in_func or not block_class_ann)):
+                walk(node.annotation, in_func)
+            if node.value is not None:
+                walk(node.value, in_func)
+            return
+        for field in node._fields:
+            val = getattr(node, field)
+            if isinstance(val, list):
+                if field in ("body", "orelse", "finalbody"):
+                    val = _clean_stmts(val)
+                for item in val:
+                    if isinstance(item, ast.AST):
+                        walk(item, in_func)
+            elif isinstance(val, ast.AST):
+                walk(val, in_func)
+
+    for s in stmts:
+        walk(s, False)
+    return names
+
+
+def _is_safe_imp_mod(mod: str, kept_mods: set[str]) -> bool:
+    if mod in kept_mods or mod in _PURE_IMPORT_MODS or mod in _CORE_SQLGLOT_MODS:
+        return True
+    root = mod.split(".")[0]
+    return root in _PURE_IMPORT_MODS
 
 
 def _static_ast_key_tag(k: ast.AST) -> str | None:
@@ -152,7 +438,7 @@ def _static_ast_key_tag(k: ast.AST) -> str | None:
     return None
 
 
-def _diff_dict_nodes(old_d: ast.Dict, new_d: ast.Dict):
+def _diff_dict_nodes(old_d: ast.Dict, new_d: ast.Dict, allow_key_add_rem: bool = False):
     old_spreads = []
     old_map = {}
     old_untracked = {}
@@ -191,9 +477,9 @@ def _diff_dict_nodes(old_d: ast.Dict, new_d: ast.Dict):
 
     if len(old_spreads) != len(new_spreads) or not all(ast_equal(ov, nv) for ov, nv in zip(old_spreads, new_spreads)):
         return None
-    if set(old_map.keys()) != set(new_map.keys()):
-        return None
     if set(old_untracked.keys()) != set(new_untracked.keys()):
+        return None
+    if not allow_key_add_rem and set(old_map.keys()) != set(new_map.keys()):
         return None
 
     lambda_pairs = []
@@ -205,8 +491,9 @@ def _diff_dict_nodes(old_d: ast.Dict, new_d: ast.Dict):
             else:
                 return None
 
-    changed_keys = set()
-    for k, ov in old_map.items():
+    changed_keys = (set(old_map.keys()) ^ set(new_map.keys())) if allow_key_add_rem else set()
+    for k in old_map.keys() & new_map.keys():
+        ov = old_map[k]
         nv = new_map[k]
         if not ast_equal(ov, nv):
             if isinstance(ov, ast.Lambda) and isinstance(nv, ast.Lambda) and ast_equal(ov.args, nv.args):
@@ -271,17 +558,43 @@ def _extract_cmp_none_arg(node: ast.AST, op_cls: type) -> ast.AST | None:
     return None
 
 
+def _is_bool_call(n: ast.AST) -> ast.AST | None:
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "bool" and len(n.args) == 1 and not n.keywords:
+        return n.args[0]
+    return None
+
+
+def _is_double_not(n: ast.AST) -> ast.AST | None:
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not) and isinstance(n.operand, ast.UnaryOp) and isinstance(n.operand.op, ast.Not):
+        return n.operand.operand
+    return None
+
+
+def _is_bool_shadowed(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "bool" and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "bool":
+            return True
+        if isinstance(node, ast.arg) and node.arg == "bool":
+            return True
+    return False
+
+
 def analyze_diff_asts(
     old_tree: ast.AST,
     new_tree: ast.AST,
     ignore_annotations: bool = False,
     block_class_ann: bool = False,
     collect_runtime_swaps: bool = True,
+    rel: str = "",
+    exported_syms: set[str] | list[str] | tuple[str, ...] = (),
 ):
     cmp_swaps = []
     falsy_swaps = []
     dict_diffs = []
     other_spans = []
+    allow_bool_builtin = not (_is_bool_shadowed(old_tree) or _is_bool_shadowed(new_tree))
 
     def walk_cmp(o: ast.AST, n: ast.AST, cls_stack: list[str], in_func: bool, bool_ctx: bool) -> bool:
         # 1. Pure boolean negation / operator inversion (symmetric, 0 tests)
@@ -297,6 +610,43 @@ def analyze_diff_asts(
             if type(n.operand.op) is not type(o.op) and len(n.operand.values) == len(o.values):
                 if all(_pure_neg_equiv(ov, nv) for ov, nv in zip(o.values, n.operand.values)):
                     return True
+
+        # 2b. Pure bool_ctx & ternary equivalences (0 tests)
+        if bool_ctx:
+            dn_o = _is_double_not(o)
+            if dn_o is not None and walk_cmp(dn_o, n, cls_stack, in_func, True):
+                return True
+            dn_n = _is_double_not(n)
+            if dn_n is not None and walk_cmp(o, dn_n, cls_stack, in_func, True):
+                return True
+            if allow_bool_builtin:
+                bc_o = _is_bool_call(o)
+                if bc_o is not None and walk_cmp(bc_o, n, cls_stack, in_func, True):
+                    return True
+                bc_n = _is_bool_call(n)
+                if bc_n is not None and walk_cmp(o, bc_n, cls_stack, in_func, True):
+                    return True
+        if allow_bool_builtin:
+            if isinstance(o, ast.IfExp) and isinstance(o.body, ast.Constant) and isinstance(o.orelse, ast.Constant):
+                if o.body.value is True and o.orelse.value is False:
+                    bc_n = _is_bool_call(n)
+                    if bc_n is not None and walk_cmp(o.test, bc_n, cls_stack, in_func, True):
+                        return True
+                    if bool_ctx and walk_cmp(o.test, n, cls_stack, in_func, True):
+                        return True
+                elif o.body.value is False and o.orelse.value is True:
+                    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not) and walk_cmp(o.test, n.operand, cls_stack, in_func, True):
+                        return True
+            if isinstance(n, ast.IfExp) and isinstance(n.body, ast.Constant) and isinstance(n.orelse, ast.Constant):
+                if n.body.value is True and n.orelse.value is False:
+                    bc_o = _is_bool_call(o)
+                    if bc_o is not None and walk_cmp(bc_o, n.test, cls_stack, in_func, True):
+                        return True
+                    if bool_ctx and walk_cmp(o, n.test, cls_stack, in_func, True):
+                        return True
+                elif n.body.value is False and n.orelse.value is True:
+                    if isinstance(o, ast.UnaryOp) and isinstance(o.op, ast.Not) and walk_cmp(o.operand, n.test, cls_stack, in_func, True):
+                        return True
 
         if collect_runtime_swaps:
             # 3. x is None <-> not x (returns bool in both forms)
@@ -334,9 +684,71 @@ def analyze_diff_asts(
         if type(o) is not type(n):
             return False
 
+        # 6. ImportFrom alias reordering (same module & level, same set of (name, asname))
+        if isinstance(o, ast.ImportFrom):
+            if o.module == n.module and o.level == n.level:
+                o_aliases = sorted((a.name, a.asname or "") for a in o.names)
+                n_aliases = sorted((a.name, a.asname or "") for a in n.names)
+                if o_aliases == n_aliases:
+                    return True
+
+        # 7. Module body handling: docstrings, TYPE_CHECKING, @overload, RET505, safe unused imports
+        if isinstance(o, ast.Module):
+            ob = _clean_stmts(o.body, strip_doc=True, strip_overloads=ignore_annotations)
+            nb = _clean_stmts(n.body, strip_doc=True, strip_overloads=ignore_annotations)
+            if len(ob) != len(nb):
+                def _is_non_future_imp(st: ast.stmt) -> bool:
+                    return isinstance(st, ast.Import) or (isinstance(st, ast.ImportFrom) and st.module != "__future__")
+
+                o_imps = [s for s in ob if _is_non_future_imp(s)]
+                n_imps = [s for s in nb if _is_non_future_imp(s)]
+                o_rest = [s for s in ob if not _is_non_future_imp(s)]
+                n_rest = [s for s in nb if not _is_non_future_imp(s)]
+                if len(o_rest) == len(n_rest) and rel and not rel.endswith("/__init__.py"):
+                    if not (_has_unsafe_dynamic(o) or _has_unsafe_dynamic(n)):
+                        obind, omods = _extract_imp_bindings(o_imps, rel)
+                        nbind, nmods = _extract_imp_bindings(n_imps, rel)
+                        if obind is not None and nbind is not None:
+                            diff_bounds = set(obind.keys()) ^ set(nbind.keys())
+                            common_diff = {
+                                k for k in (obind.keys() & nbind.keys()) if obind[k] != nbind[k]
+                            }
+                            if not common_diff:
+                                exp_set = set(exported_syms)
+                                safe_imp = "__STAR__" not in exp_set
+                                if safe_imp and diff_bounds:
+                                    rt_names = (
+                                        _collect_runtime_names(o_rest, ignore_annotations, block_class_ann)
+                                        | _collect_runtime_names(n_rest, ignore_annotations, block_class_ann)
+                                    )
+                                    safe_imp = all(b not in rt_names and b not in exp_set for b in diff_bounds)
+                                    if safe_imp:
+                                        for b in diff_bounds:
+                                            if b in obind and not _is_safe_imp_mod(obind[b][0], nmods):
+                                                safe_imp = False
+                                                break
+                                            if b in nbind:
+                                                m_add = nbind[b][0]
+                                                if not (m_add in omods or m_add.split(".")[0] in _PURE_IMPORT_MODS or m_add in _PURE_IMPORT_MODS):
+                                                    safe_imp = False
+                                                    break
+                                elif safe_imp and not diff_bounds:
+                                    o_seq = list(dict.fromkeys(obind[k][0] for k in obind))
+                                    n_seq = list(dict.fromkeys(nbind[k][0] for k in nbind))
+                                    if o_seq != n_seq:
+                                        safe_imp = all(_is_safe_imp_mod(m, set()) for m in omods | nmods)
+                                if safe_imp:
+                                    ob, nb = o_rest, n_rest
+            if len(ob) != len(nb):
+                return False
+            for oi, ni in zip(ob, nb):
+                if not walk_cmp(oi, ni, cls_stack, False, False):
+                    return False
+            return True
+
         if isinstance(o, ast.ClassDef):
-            obody = _filter_tc_stmts(o.body)
-            nbody = _filter_tc_stmts(n.body)
+            obody = _clean_stmts(o.body, strip_doc=True, strip_overloads=ignore_annotations)
+            nbody = _clean_stmts(n.body, strip_doc=True, strip_overloads=ignore_annotations)
             if (
                 o.name != n.name
                 or len(obody) != len(nbody)
@@ -367,7 +779,11 @@ def analyze_diff_asts(
                 ):
                     target_id = o.target.id
             if target_id is not None:
-                res = _diff_dict_nodes(o.value, n.value)
+                res = _diff_dict_nodes(
+                    o.value,
+                    n.value,
+                    allow_key_add_rem=(target_id not in _TRIE_DICT_ATTRS and bool(o.value.keys) and bool(n.value.keys)),
+                )
                 if res is not None:
                     changed_keys, lambda_pairs = res
                     if changed_keys:
@@ -376,21 +792,33 @@ def analyze_diff_asts(
                         if not walk_cmp(ob, nb, cls_stack, True, False):
                             return False
                     return True
-
-        if collect_runtime_swaps and isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1:
-            op_pair = (type(o.ops[0]).__name__, type(n.ops[0]).__name__)
-            if op_pair in REVERSIBLE_CMPS:
-                if ast_equal(o.left, n.left) and len(o.comparators) == len(n.comparators) == 1 and ast_equal(o.comparators[0], n.comparators[0]):
-                    if op_pair[0] in ("Eq", "NotEq"):
-                        if not (_is_const_none_or_bool(o.left) or _is_const_none_or_bool(o.comparators[0])):
-                            other_spans.append((o.lineno, o.end_lineno or o.lineno))
-                            return True
-                    cmp_swaps.append((o.lineno, o.col_offset, op_pair[0]))
-                    return True
                 other_spans.append((o.lineno, o.end_lineno or o.lineno))
                 return True
 
+        if isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1 and len(o.comparators) == 1 and len(n.comparators) == 1:
+            if type(o.ops[0]) is type(n.ops[0]) and isinstance(o.ops[0], (ast.Is, ast.IsNot)):
+                if (
+                    isinstance(o.left, (ast.Constant, ast.Name))
+                    and isinstance(o.comparators[0], (ast.Constant, ast.Name))
+                    and ast_equal(o.left, n.comparators[0])
+                    and ast_equal(o.comparators[0], n.left)
+                ):
+                    return True
+            if collect_runtime_swaps:
+                op_pair = (type(o.ops[0]).__name__, type(n.ops[0]).__name__)
+                if op_pair in REVERSIBLE_CMPS:
+                    if ast_equal(o.left, n.left) and ast_equal(o.comparators[0], n.comparators[0]):
+                        if op_pair[0] in ("Eq", "NotEq"):
+                            if not (_is_const_none_or_bool(o.left) or _is_const_none_or_bool(o.comparators[0])):
+                                other_spans.append((o.lineno, o.end_lineno or o.lineno))
+                                return True
+                        cmp_swaps.append((o.lineno, o.col_offset, op_pair[0]))
+                        return True
+                    other_spans.append((o.lineno, o.end_lineno or o.lineno))
+                    return True
+
         child_in_func = in_func or isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        strip_body_doc = isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef))
         for field in o._fields:
             if ignore_annotations:
                 if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) and field in ("returns", "type_params"):
@@ -398,7 +826,7 @@ def analyze_diff_asts(
                 if isinstance(o, ast.arg) and field == "annotation":
                     continue
                 if isinstance(o, ast.AnnAssign) and field == "annotation":
-                    if in_func or (o.value is not None and n.value is not None and not block_class_ann):
+                    if (o.value is None) == (n.value is None) and (in_func or not block_class_ann):
                         continue
 
             if isinstance(o, (ast.If, ast.While, ast.IfExp, ast.Assert)):
@@ -416,8 +844,8 @@ def analyze_diff_asts(
             nv = getattr(n, field)
             if isinstance(ov, list) and isinstance(nv, list):
                 if field in ("body", "orelse", "finalbody"):
-                    ov = _filter_tc_stmts(ov)
-                    nv = _filter_tc_stmts(nv)
+                    ov = _clean_stmts(ov, strip_doc=(strip_body_doc and field == "body"), strip_overloads=ignore_annotations)
+                    nv = _clean_stmts(nv, strip_doc=(strip_body_doc and field == "body"), strip_overloads=ignore_annotations)
                 if len(ov) != len(nv):
                     return False
                 for oi, ni in zip(ov, nv):
@@ -443,33 +871,40 @@ def analyze_diff_asts(
     return cmp_swaps, falsy_swaps, dict_diffs, other_spans, not ok
 
 
-def _only_added_new_test_methods(old_tree: ast.AST, new_tree: ast.AST, rel: str, id_to_num: dict[str, int]) -> bool:
-    if not (isinstance(old_tree, ast.Module) and isinstance(new_tree, ast.Module)):
-        return False
-    ob = _filter_tc_stmts(old_tree.body)
-    nb = _filter_tc_stmts(new_tree.body)
-    if len(ob) != len(nb):
-        return False
-    added_any = False
-    for os_n, ns_n in zip(ob, nb):
-        if isinstance(os_n, ast.ClassDef) and isinstance(ns_n, ast.ClassDef) and os_n.name == ns_n.name:
-            if not (ast_equal(os_n.bases, ns_n.bases) and ast_equal(os_n.keywords, ns_n.keywords) and ast_equal(os_n.decorator_list, ns_n.decorator_list)):
-                return False
-            oc = _filter_tc_stmts(os_n.body)
-            nc = _filter_tc_stmts(ns_n.body)
-            oi = 0
-            for item in nc:
-                if oi < len(oc) and ast_equal(oc[oi], item):
-                    oi += 1
-                elif isinstance(item, ast.FunctionDef) and item.name.startswith("test_") and f"{rel}::{ns_n.name}::{item.name}" not in id_to_num:
-                    added_any = True
+def _strip_new_test_methods(new_tree: ast.AST, rel: str, id_to_num: dict[str, int]) -> ast.AST:
+    if not isinstance(new_tree, ast.Module):
+        return new_tree
+    changed = False
+    new_mod_body = []
+    for s in new_tree.body:
+        if isinstance(s, ast.ClassDef) and s.name != "Validator":
+            filtered_cls_body = []
+            cls_changed = False
+            for item in s.body:
+                if isinstance(item, ast.FunctionDef) and item.name.startswith("test_") and f"{rel}::{s.name}::{item.name}" not in id_to_num:
+                    cls_changed = True
+                    changed = True
                 else:
-                    return False
-            if oi != len(oc):
-                return False
-        elif not ast_equal(os_n, ns_n):
-            return False
-    return added_any
+                    filtered_cls_body.append(item)
+            if cls_changed:
+                c_copy = ast.ClassDef(
+                    name=s.name,
+                    bases=s.bases,
+                    keywords=s.keywords,
+                    body=filtered_cls_body,
+                    decorator_list=s.decorator_list,
+                    type_params=getattr(s, "type_params", []),
+                )
+                ast.copy_location(c_copy, s)
+                new_mod_body.append(c_copy)
+            else:
+                new_mod_body.append(s)
+        else:
+            new_mod_body.append(s)
+    if not changed:
+        return new_tree
+    m_copy = ast.Module(body=new_mod_body, type_ignores=new_tree.type_ignores)
+    return m_copy
 
 
 def parse_patch(patch_text: str) -> list[dict]:
@@ -571,10 +1006,13 @@ def pack_workers(test_nums: set[int], dur_ms: dict[int, int]) -> list[list[int]]
             workers[idx].append(t)
             loads[idx] += dur_ms[t]
 
-        if k > 1 and len(ordered) <= 400:
+        max_single = dur_ms[ordered[0]]
+        if k > 1 and len(ordered) <= 800:
             for _ in range(40):
                 hi = loads.index(max(loads))
                 cur_max = loads[hi]
+                if cur_max <= max_single:
+                    break
                 best_action = None
                 best_new_max = cur_max
 
@@ -702,8 +1140,7 @@ def main() -> None:
     mod_attr_readers = maps.get("mod_attr_readers", {})
     mod_name_readers = maps.get("mod_name_readers", {})
     file_deps = maps.get("file_deps", {})
-    cmp_diff_to_tests = make_lazy_dict(maps.get("cmp_diff_to_idxs", {}))
-    scalar_attr_to_tests = make_lazy_dict(maps.get("scalar_attr_to_idxs", {}))
+    imported_from_file = maps.get("imported_from_file", {})
     cls_sub_qualnames = maps.get("cls_sub_qualnames", {})
     tracked_dicts = {tuple(x) for x in maps.get("tracked_dicts", ())}
     test_dict_readers = maps.get("test_dict_readers", {})
@@ -711,11 +1148,12 @@ def main() -> None:
 
     if is_split:
         file_ids = maps["file_ids"]
-        ast_hashes = maps["ast_hashes"]
         test_methods_map = maps["test_methods"]
         _readers_cache: dict | None = None
         _dict_keys_cache: dict | None = None
         _falsy_diffs_cache: dict | None = None
+        _cmp_diffs_cache: dict | None = None
+        _scalar_attrs_cache: dict | None = None
 
         def get_readers() -> tuple[dict, dict]:
             nonlocal _readers_cache
@@ -746,6 +1184,28 @@ def main() -> None:
                     _falsy_diffs_cache = {}
             return _falsy_diffs_cache
 
+        def get_cmp_diffs() -> dict:
+            nonlocal _cmp_diffs_cache
+            if _cmp_diffs_cache is None:
+                cd_path = maps_dir / "cmp_diffs.pkl"
+                if cd_path.exists():
+                    with open(cd_path, "rb") as cd:
+                        _cmp_diffs_cache = pickle.load(cd)
+                else:
+                    _cmp_diffs_cache = maps.get("cmp_diff_to_idxs", {})
+            return _cmp_diffs_cache
+
+        def get_scalar_attr_map() -> dict:
+            nonlocal _scalar_attrs_cache
+            if _scalar_attrs_cache is None:
+                sa_path = maps_dir / "scalar_attrs.pkl"
+                if sa_path.exists():
+                    with open(sa_path, "rb") as sa:
+                        _scalar_attrs_cache = pickle.load(sa)
+                else:
+                    _scalar_attrs_cache = maps.get("scalar_attr_to_idxs", {})
+            return _scalar_attrs_cache
+
         _meta_cache: dict[str, dict] = {}
 
         def get_meta(rel: str) -> dict | None:
@@ -762,9 +1222,6 @@ def main() -> None:
 
         def has_file(rel: str) -> bool:
             return rel in file_ids
-
-        def get_ast_hash(rel: str) -> str | None:
-            return ast_hashes.get(rel)
 
         def get_test_methods(rel: str) -> list:
             return test_methods_map.get(rel, ())
@@ -817,12 +1274,14 @@ def main() -> None:
         def get_falsy_diffs() -> dict:
             return {}
 
+        def get_cmp_diffs() -> dict:
+            return maps.get("cmp_diff_to_idxs", {})
+
+        def get_scalar_attr_map() -> dict:
+            return maps.get("scalar_attr_to_idxs", {})
+
         def has_file(rel: str) -> bool:
             return rel in file_data
-
-        def get_ast_hash(rel: str) -> str | None:
-            fd = file_data.get(rel)
-            return fd.get("ast_hash") if fd else None
 
         def get_test_methods(rel: str) -> list:
             fd = file_data.get(rel)
@@ -960,8 +1419,8 @@ def main() -> None:
                     for h in fdiff["hunks"]:
                         for hl in h["lines"]:
                             if hl and hl[0] in ("+", "-"):
-                                body = hl[1:].strip()
-                                if body and not body.startswith("--"):
+                                raw = hl[1:].rstrip("\r\n")
+                                if raw and not raw.startswith("--"):
                                     non_comment = True
                                     break
                         if non_comment:
@@ -1007,15 +1466,16 @@ def main() -> None:
                     old_ast = get_orig_ast(rel, orig_src)
                     if ast_equal(old_ast, new_ast):
                         continue
+                    stripped_new_ast = _strip_new_test_methods(new_ast, rel, id_to_num)
                     _, _, _, t_other_spans, t_mismatch = analyze_diff_asts(
                         old_ast,
-                        new_ast,
+                        stripped_new_ast,
                         ignore_annotations=has_future_annotations(old_ast),
                         collect_runtime_swaps=False,
+                        rel=rel,
+                        exported_syms=imported_from_file.get(rel, ()),
                     )
                     if not t_mismatch and not t_other_spans:
-                        continue
-                    if _only_added_new_test_methods(old_ast, new_ast, rel, id_to_num):
                         continue
                     t_use_ast = True
 
@@ -1199,6 +1659,8 @@ def main() -> None:
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
                 old_ast = get_orig_ast(rel, orig_src)
+                if rel.startswith("sqlglot/typing/") and not ast_equal(old_ast, new_ast):
+                    selected.update(tests_by_file.get("tests/test_typing.py", ()))
                 ignore_ann = (rel not in _RUNTIME_ANN_FILES) and has_future_annotations(old_ast)
                 block_class_ann = rel in _CLASS_ANN_FILES
                 cmp_swaps, falsy_swaps, dict_diffs, other_spans, mismatch = analyze_diff_asts(
@@ -1206,12 +1668,13 @@ def main() -> None:
                     new_ast,
                     ignore_annotations=ignore_ann,
                     block_class_ann=block_class_ann,
+                    rel=rel,
+                    exported_syms=imported_from_file.get(rel, ()),
                 )
                 if not mismatch and not cmp_swaps and not falsy_swaps and not dict_diffs and not other_spans:
                     continue
                 use_ast_diff = True
-
-            if rel.startswith("sqlglot/typing/"):
+            elif rel.startswith("sqlglot/typing/"):
                 selected.update(tests_by_file.get("tests/test_typing.py", ()))
 
             if not has_file(rel):
@@ -1219,12 +1682,16 @@ def main() -> None:
                 continue
 
             if use_ast_diff and not mismatch:
-                for ln, col, op_name in cmp_swaps:
-                    linfo = get_line_info(rel, ln)
-                    if (linfo.get("func") and linfo["func"] not in ONCE_FUNCS) or linfo.get("is_lambda"):
-                        selected.update(cmp_diff_to_tests.get(f"{rel}:{ln}:{col}:{op_name}", ()))
-                    else:
-                        other_spans.append((ln, ln))
+                if cmp_swaps:
+                    cd_map = get_cmp_diffs()
+                    for ln, col, op_name in cmp_swaps:
+                        linfo = get_line_info(rel, ln)
+                        if (linfo.get("func") and linfo["func"] not in ONCE_FUNCS) or linfo.get("is_lambda"):
+                            idxs = cd_map.get(f"{rel}:{ln}:{col}:{op_name}")
+                            if idxs:
+                                selected.update(remap_idxs(idxs))
+                        else:
+                            other_spans.append((ln, ln))
 
                 if falsy_swaps:
                     fd_map = get_falsy_diffs()
@@ -1348,16 +1815,19 @@ def main() -> None:
                                         t_here = tests_for_reader_loc(r_rel, r_ln)
                                         if t_here:
                                             sqlglot_matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
+                                if attr_name == "TRANSFORMS":
+                                    sqlglot_matched.update(component_tests_for_reader(d_names, "sqlglot/generator.py", 1030))
                                 if has_sqlglot_reader and attr_name in scalar_attrs:
+                                    sa_map = get_scalar_attr_map()
                                     sc_tests = set()
                                     sc_keys = set(d_names)
                                     if cls_name:
                                         sc_keys.update(cls_sub_qualnames.get(cls_name, (cls_name,)))
                                     for k in sc_keys:
-                                        t = scalar_attr_to_tests.get(f"{k}|{attr_name}")
+                                        t = sa_map.get(f"{k}|{attr_name}")
                                         if t:
-                                            sc_tests.update(t)
-                                    selected.update(sqlglot_matched & sc_tests)
+                                            sc_tests.update(remap_idxs(t))
+                                    selected.update(sc_tests if sc_tests else sqlglot_matched)
                                 else:
                                     selected.update(sqlglot_matched)
                                 selected.update(test_matched)

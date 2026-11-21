@@ -238,8 +238,8 @@ def _stmts_terminate(stmts: list[ast.stmt]) -> bool:
 
 
 def _clean_stmts(stmts: list[ast.stmt], strip_doc: bool = False, strip_overloads: bool = False) -> list[ast.stmt]:
-    if strip_doc and stmts and _is_docstring_stmt(stmts[0]):
-        stmts = stmts[1:]
+    if strip_doc:
+        stmts = [s for s in stmts if not _is_docstring_stmt(s)]
     filtered: list[ast.stmt] = []
     for s in stmts:
         if isinstance(s, ast.If) and _is_type_checking(s.test):
@@ -1483,7 +1483,8 @@ def main() -> None:
     def select_for_patch(patch_text: str) -> tuple[set[int], dict]:
         selected: set[int] = set()
         touch_info: dict = {
-            "subtest_eligible": True,
+            "subtest_global_block": False,
+            "subtest_blocked_tests": set(),
             "touched_lines": set(),
             "touched_dicts": set(),
             "touched_attrs": set(),
@@ -1518,26 +1519,29 @@ def main() -> None:
                     if not non_comment:
                         continue
 
-                touch_info["subtest_eligible"] = False
                 fx_tests = fixture_to_tests.get(rel)
                 if fx_tests:
                     selected.update(fx_tests)
+                    touch_info["subtest_blocked_tests"].update(fx_tests)
                 else:
+                    fb_fx: set[int] = set()
                     if "tpc-h" in rel or "tpc-ds" in rel:
-                        selected.update(tests_by_file["tests/test_executor.py"])
+                        fb_fx.update(tests_by_file["tests/test_executor.py"])
                     elif "optimizer/" in rel:
-                        selected.update(tests_by_file["tests/test_optimizer.py"])
+                        fb_fx.update(tests_by_file["tests/test_optimizer.py"])
                     else:
-                        selected.update(tests_by_file["tests/test_transpile.py"])
-                        selected.update(tests_by_file["tests/test_serde.py"])
+                        fb_fx.update(tests_by_file["tests/test_transpile.py"])
+                        fb_fx.update(tests_by_file["tests/test_serde.py"])
+                    selected.update(fb_fx)
+                    touch_info["subtest_blocked_tests"].update(fb_fx)
                 continue
 
             # 2. Test files
             if rel.startswith("tests/"):
                 default_test_fallback = file_importers.get(rel, set() if rel in file_deps else all_test_nums)
                 if not rel.endswith(".py") or fdiff["new_file"] or fdiff["deleted_file"]:
-                    touch_info["subtest_eligible"] = False
                     selected.update(default_test_fallback)
+                    touch_info["subtest_blocked_tests"].update(default_test_fallback)
                     continue
 
                 if has_file(rel) and is_comment_or_blank_only(fdiff["hunks"], get_str_lines(rel)):
@@ -1554,8 +1558,8 @@ def main() -> None:
                     try:
                         new_ast = ast.parse(patched_src)
                     except SyntaxError:
-                        touch_info["subtest_eligible"] = False
                         selected.update(default_test_fallback)
+                        touch_info["subtest_blocked_tests"].update(default_test_fallback)
                         continue
                     old_ast = get_orig_ast(rel, orig_src)
                     if ast_equal(old_ast, new_ast):
@@ -1573,7 +1577,7 @@ def main() -> None:
                         continue
                     t_use_ast = True
 
-                touch_info["subtest_eligible"] = False
+                touch_info["subtest_blocked_tests"].update(default_test_fallback)
                 test_methods = get_test_methods(rel)
                 if rel in tests_by_file and test_methods:
                     matched_tests: set[int] = set()
@@ -1739,15 +1743,16 @@ def main() -> None:
             # 3. Non-sqlglot files
             if not rel.startswith("sqlglot/"):
                 if "sqlglotc" in rel:
-                    touch_info["subtest_eligible"] = False
-                    selected.update(tests_by_file.get("tests/test_sqlglotc.py", ()))
+                    sc_t = tests_by_file.get("tests/test_sqlglotc.py", ())
+                    touch_info["subtest_blocked_tests"].update(sc_t)
+                    selected.update(sc_t)
                 continue
 
             if not rel.endswith(".py"):
                 continue
 
             if fdiff["new_file"] or fdiff["deleted_file"]:
-                touch_info["subtest_eligible"] = False
+                touch_info["subtest_global_block"] = True
                 selected.update(file_importers.get(rel, all_test_nums))
                 continue
 
@@ -1768,7 +1773,7 @@ def main() -> None:
                 try:
                     new_ast = ast.parse(patched_src)
                 except SyntaxError:
-                    touch_info["subtest_eligible"] = False
+                    touch_info["subtest_global_block"] = True
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
                 old_ast = get_orig_ast(rel, orig_src)
@@ -1791,12 +1796,12 @@ def main() -> None:
                 selected.update(tests_by_file.get("tests/test_typing.py", ()))
 
             if not has_file(rel):
-                touch_info["subtest_eligible"] = False
+                touch_info["subtest_global_block"] = True
                 selected.update(all_test_nums)
                 continue
 
             if not use_ast_diff or mismatch:
-                touch_info["subtest_eligible"] = False
+                touch_info["subtest_global_block"] = True
 
             if use_ast_diff and not mismatch:
                 if cmp_swaps:
@@ -1851,6 +1856,20 @@ def main() -> None:
                 if not other_spans and not extra_anchors:
                     continue
 
+            _DYNAMIC_ONCE_ATTRS = frozenset({
+                "INVERSE_TIME_MAPPING",
+                "SUPPORTED_JSON_PATH_PARTS",
+                "BYTE_STRING_ESCAPES",
+                "tokenizer_class",
+                "jsonpath_tokenizer_class",
+                "parser_class",
+                "generator_class",
+                "Parser",
+                "Generator",
+                "Tokenizer",
+                "JSONPathTokenizer",
+            })
+
             def process_sqlglot_line(ln: int, allow_neighbor_delta: bool) -> None:
                 if ln < 1:
                     return
@@ -1862,7 +1881,7 @@ def main() -> None:
                         selected.update(tests_for_line_or_span(rel, l2))
                 elif info.get("func"):
                     if info["func"] in ONCE_FUNCS:
-                        touch_info["subtest_eligible"] = False
+                        touch_info["subtest_global_block"] = True
                         selected.update(file_importers.get(rel, all_test_nums))
                         return
                     record_line_or_span(rel, ln)
@@ -1883,11 +1902,17 @@ def main() -> None:
                 elif "class_attr" in info:
                     attr_readers, name_readers = get_readers()
                     cls_name, attr_name = info["class_attr"]
+                    cls_kind, d_names = classify_class(cls_name) if cls_name else (None, None)
+                    is_dialect_family = (
+                        (d_names is not None)
+                        or (cls_name in BASE_CLASSES)
+                        or (bool(cls_name) and cls_name.split(".")[-1] == "_TokenizerBase")
+                    )
                     is_expr_class_attr = rel.startswith("sqlglot/expressions/") and attr_name in GENERIC_EXPR_ATTRS
                     reader_locs: list[str] = []
                     if attr_name and not is_expr_class_attr:
                         reader_locs.extend(attr_readers.get(attr_name, ()))
-                    if cls_name:
+                    if cls_name and (is_expr_class_attr or not attr_name or not is_dialect_family):
                         short_cls = cls_name.split(".")[-1]
                         reader_locs.extend(name_readers.get(cls_name, ()))
                         reader_locs.extend(attr_readers.get(cls_name, ()))
@@ -1896,31 +1921,38 @@ def main() -> None:
                             reader_locs.extend(attr_readers.get(short_cls, ()))
 
                     importers_of_rel = mod_importers.get(rel, {rel})
-                    cls_kind, d_names = classify_class(cls_name) if cls_name else (None, None)
 
                     def tests_for_reader_loc(r_rel: str, r_ln: int) -> set[int]:
                         direct = get_line_tests(r_rel, r_ln)
                         return direct if direct else tests_for_line_or_span(r_rel, r_ln)
 
+                    has_once_reader = bool(attr_name in _DYNAMIC_ONCE_ATTRS)
+                    sqlglot_reader_pairs: list[tuple[str, int]] = []
+                    test_matched: set[int] = set()
+                    for loc in reader_locs:
+                        r_rel, r_ln_str = loc.rsplit(":", 1)
+                        r_ln = int(r_ln_str)
+                        if r_rel.startswith("tests/"):
+                            test_matched.update(tests_for_test_line(r_rel, r_ln))
+                        else:
+                            sqlglot_reader_pairs.append((r_rel, r_ln))
+                            if not has_once_reader and get_line_info(r_rel, r_ln).get("func") in ONCE_FUNCS:
+                                has_once_reader = True
+
                     if d_names is not None:
-                        if reader_locs:
+                        if has_once_reader:
+                            touch_info["subtest_global_block"] = True
+                            selected.update(union_dialect_tests(d_names))
+                            selected.update(test_matched)
+                        elif reader_locs:
                             sqlglot_matched = set()
-                            has_sqlglot_reader = False
-                            sqlglot_reader_pairs: list[tuple[str, int]] = []
-                            test_matched = set()
-                            for loc in reader_locs:
-                                r_rel, r_ln_str = loc.rsplit(":", 1)
-                                r_ln = int(r_ln_str)
-                                if r_rel.startswith("tests/"):
-                                    test_matched.update(tests_for_test_line(r_rel, r_ln))
-                                else:
-                                    has_sqlglot_reader = True
-                                    sqlglot_reader_pairs.append((r_rel, r_ln))
-                                    t_here = tests_for_reader_loc(r_rel, r_ln)
-                                    if t_here:
-                                        sqlglot_matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
+                            has_sqlglot_reader = bool(sqlglot_reader_pairs)
+                            for r_rel, r_ln in sqlglot_reader_pairs:
+                                t_here = tests_for_reader_loc(r_rel, r_ln)
+                                if t_here:
+                                    sqlglot_matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
                             if attr_name == "TRANSFORMS":
-                                touch_info["subtest_eligible"] = False
+                                touch_info["subtest_global_block"] = True
                                 sqlglot_matched.update(component_tests_for_reader(d_names, "sqlglot/generator.py", 1030))
                             if has_sqlglot_reader and attr_name in scalar_attrs:
                                 sa_map = get_scalar_attr_map()
@@ -1947,22 +1979,43 @@ def main() -> None:
                                 selected.update(sqlglot_matched)
                             selected.update(test_matched)
                         else:
-                            touch_info["subtest_eligible"] = False
+                            touch_info["subtest_global_block"] = True
                             selected.update(union_dialect_tests(d_names))
                         if attr_name:
                             for mrel in mod_attr_readers.get(attr_name, ()):
                                 if mrel in importers_of_rel:
-                                    touch_info["subtest_eligible"] = False
+                                    touch_info["subtest_global_block"] = True
                                     selected.update(file_importers.get(mrel, ()))
+                    elif has_once_reader:
+                        touch_info["subtest_global_block"] = True
+                        selected.update(get_file_cov(rel))
+                        selected.update(file_importers.get(rel, ()))
+                        selected.update(test_matched)
                     elif reader_locs:
-                        for loc in reader_locs:
-                            r_rel, r_ln_str = loc.rsplit(":", 1)
-                            r_ln = int(r_ln_str)
-                            if r_rel.startswith("tests/"):
-                                selected.update(tests_for_test_line(r_rel, r_ln))
+                        if is_dialect_family and not is_expr_class_attr and sqlglot_reader_pairs and attr_name in scalar_attrs:
+                            sa_map = get_scalar_attr_map()
+                            sc_tests = set()
+                            sc_keys = set(cls_sub_qualnames.get(cls_name, (cls_name,))) if cls_name else set()
+                            sc_keys.update(dialect_subclasses.get("Dialect", ()))
+                            sc_keys.add("Dialect")
+                            for k in sc_keys:
+                                ak = f"{k}|{attr_name}"
+                                t = sa_map.get(ak)
+                                if t:
+                                    sc_tests.update(remap_idxs(t))
+                            if sc_tests:
+                                for k in sc_keys:
+                                    touch_info["touched_attrs"].add(f"{k}|{attr_name}")
+                                selected.update(sc_tests)
                             else:
+                                for r_rel, r_ln in sqlglot_reader_pairs:
+                                    record_line_or_span(r_rel, r_ln)
+                                    selected.update(tests_for_reader_loc(r_rel, r_ln))
+                        else:
+                            for r_rel, r_ln in sqlglot_reader_pairs:
                                 record_line_or_span(r_rel, r_ln)
                                 selected.update(tests_for_reader_loc(r_rel, r_ln))
+                        selected.update(test_matched)
                         if attr_name:
                             mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
                             if is_expr_class_attr and cls_name:
@@ -1971,17 +2024,17 @@ def main() -> None:
                             else:
                                 mod_matches = mod_attr_set & importers_of_rel
                             for mrel in mod_matches:
-                                touch_info["subtest_eligible"] = False
+                                touch_info["subtest_global_block"] = True
                                 selected.update(file_importers.get(mrel, ()))
                     elif not is_expr_class_attr:
-                        touch_info["subtest_eligible"] = False
+                        touch_info["subtest_global_block"] = True
                         selected.update(get_file_cov(rel))
                 elif "module_var" in info:
-                    touch_info["subtest_eligible"] = False
                     attr_readers, name_readers = get_readers()
                     var_name = info["module_var"]
                     importers_of_rel = mod_importers.get(rel, {rel})
                     reader_locs = []
+                    mod_hit = False
                     if var_name:
                         for loc in name_readers.get(var_name, ()):
                             r_rel, _ = loc.rsplit(":", 1)
@@ -1993,10 +2046,13 @@ def main() -> None:
                                 reader_locs.append(loc)
                         for mrel in mod_name_readers.get(var_name, ()):
                             if mrel in importers_of_rel:
+                                mod_hit = True
                                 selected.update(file_importers.get(mrel, ()))
                         for mrel in mod_attr_readers.get(var_name, ()):
                             if mrel in importers_of_rel:
+                                mod_hit = True
                                 selected.update(file_importers.get(mrel, ()))
+                    has_once_var = False
                     if reader_locs:
                         for loc in reader_locs:
                             r_rel, r_ln_str = loc.rsplit(":", 1)
@@ -2004,11 +2060,18 @@ def main() -> None:
                             if r_rel.startswith("tests/"):
                                 selected.update(tests_for_test_line(r_rel, r_ln))
                             else:
+                                if get_line_info(r_rel, r_ln).get("func") in ONCE_FUNCS:
+                                    has_once_var = True
+                                record_line_or_span(r_rel, r_ln)
                                 selected.update(tests_for_line_or_span(r_rel, r_ln))
-                    elif not (var_name and (mod_name_readers.get(var_name) or mod_attr_readers.get(var_name))):
+                        if has_once_var:
+                            selected.update(file_importers.get(rel, all_test_nums))
+                    elif not mod_hit:
                         selected.update(get_file_cov(rel))
+                    if mod_hit or has_once_var or not reader_locs:
+                        touch_info["subtest_global_block"] = True
                 else:
-                    touch_info["subtest_eligible"] = False
+                    touch_info["subtest_global_block"] = True
                     selected.update(get_file_cov(rel))
 
             seen_lines: set[int] = set()
@@ -2067,26 +2130,100 @@ def main() -> None:
             return pack_cost(s, dur_ms)
 
         subtest_map = get_subtest_map()
-        max_verify_cpu_s = float(os.environ.get("BLAST_VERIFY_BUDGET", "45.0"))
-        wall_deadline = time.monotonic() + float(os.environ.get("BLAST_VERIFY_WALL", "120.0"))
+        cpu_path = maps_dir / "test_cpu.pkl"
+        if cpu_path.exists():
+            with open(cpu_path, "rb") as cf:
+                base_cpu_info = pickle.load(cf)
+        else:
+            base_cpu_info = {}
 
-        clean_jobs: list[tuple[int, list, dict, list, list]] = []
-        warm_jobs: list[tuple[int, list, dict, list, list]] = []
+        cache_path = maps_dir / "duckdb_cache.pkl"
+        has_cache_file = cache_path.exists()
+
+        max_verify_cpu_s = float(os.environ.get("BLAST_VERIFY_BUDGET", "50.0"))
+        default_wall = min(140.0, max(90.0, 2.5 * len(entries)))
+        wall_deadline = time.monotonic() + float(os.environ.get("BLAST_VERIFY_WALL", str(default_wall)))
+
+        cpu_info_pre = dict(base_cpu_info)
+        cpu_info_pre["heavy_preimported"] = True
+
+        raw_jobs: list[tuple[int, list, dict, dict, list, bool, bool]] = []
+        exec_job_cnt = 0
+        opt_job_cnt = 0
 
         for entry in entries:
             _, sel, patch_text, touch_info = entry
             if not sel:
                 continue
-            sub_plan = verifier.compute_subtest_plan(sel, touch_info, subtest_map, num_to_id, dur_ms, pack_cost_fn)
-            allow_zf = verifier.should_zero_fail_prove(sel, num_to_id, dur_ms, pack_cost_fn)
-            if not sub_plan and not allow_zf:
-                continue
             overlay, ok = verifier.build_patch_overlay(patch_text, REF, parse_patch, apply_hunks)
             if not ok or not overlay:
                 continue
+            can_lazy = verifier.can_lazy_executor(overlay)
+            subtest_elig, has_work, priority = verifier.plan_commit_verification(
+                sel,
+                touch_info,
+                subtest_map,
+                cpu_info_pre,
+                num_to_id,
+                dur_ms,
+                pack_cost_fn,
+                can_lazy,
+                has_cache_file,
+            )
+            if not has_work:
+                continue
             all_cands = [(num, num_to_id[num], dur_ms[num]) for num in sel if num in num_to_id]
-            priority = pack_cost_fn(sel) if sub_plan else 2000
-            job = (priority, entry, overlay, sub_plan, all_cands)
+            touches_exec = any(num_to_id.get(n, "").startswith("tests/test_executor.py::") for n in sel)
+            touches_opt = any(num_to_id.get(n, "").startswith("tests/test_optimizer.py::") for n in sel)
+            if touches_exec:
+                exec_job_cnt += 1
+            if touches_opt:
+                opt_job_cnt += 1
+            raw_jobs.append((priority, entry, overlay, subtest_elig, all_cands, touches_exec, touches_opt))
+
+        do_preimport = (exec_job_cnt >= 1) or ((exec_job_cnt + opt_job_cnt) >= 2)
+        duckdb_cache = None
+        if do_preimport:
+            try:
+                with contextlib.redirect_stdout(sys.stderr):
+                    import numpy  # noqa: F401
+                    import pandas  # noqa: F401
+                    import pandas.testing  # noqa: F401
+                    import duckdb  # noqa: F401
+            except BaseException:
+                do_preimport = False
+            if do_preimport and exec_job_cnt >= 1 and has_cache_file:
+                try:
+                    with open(cache_path, "rb") as dcf:
+                        duckdb_cache = pickle.load(dcf)
+                except BaseException:
+                    duckdb_cache = None
+
+        cpu_info_active = dict(base_cpu_info)
+        cpu_info_active["heavy_preimported"] = do_preimport
+        has_duckdb_cache = bool(duckdb_cache and duckdb_cache.get("tpcds_df_by_sql"))
+
+        clean_jobs: list[tuple[int, list, dict, dict, list]] = []
+        warm_jobs: list[tuple[int, list, dict, dict, list]] = []
+
+        for priority, entry, overlay, subtest_elig, all_cands, touches_exec, touches_opt in raw_jobs:
+            if not do_preimport and (touches_exec or touches_opt):
+                _, sel, _, touch_info = entry
+                can_lazy = verifier.can_lazy_executor(overlay)
+                subtest_elig, has_work, priority = verifier.plan_commit_verification(
+                    sel,
+                    touch_info,
+                    subtest_map,
+                    cpu_info_active,
+                    num_to_id,
+                    dur_ms,
+                    pack_cost_fn,
+                    can_lazy,
+                    has_duckdb_cache,
+                )
+                if not has_work:
+                    continue
+            job = (priority, entry, overlay, subtest_elig, all_cands)
             if verifier.needs_clean_fork(overlay):
                 clean_jobs.append(job)
             else:
@@ -2096,11 +2233,11 @@ def main() -> None:
         warm_jobs.sort(key=lambda x: -x[0])
 
         # Group A: Clean-fork BEFORE `import sqlglot`
-        for _, entry, overlay, sub_plan, all_cands in clean_jobs:
+        for _, entry, overlay, subtest_elig, all_cands in clean_jobs:
             if verifier.get_children_cpu_seconds() >= max_verify_cpu_s or time.monotonic() >= wall_deadline:
                 break
             passed, _ = verifier.verify_commit_fork(
-                REF, overlay, sub_plan, all_cands, True, pack_cost_fn, dur_ms, num_to_id
+                REF, overlay, subtest_elig, all_cands, cpu_info_active, duckdb_cache, pack_cost_fn, dur_ms, num_to_id
             )
             if passed:
                 entry[1].difference_update(passed)
@@ -2115,11 +2252,11 @@ def main() -> None:
                     import sqlglot  # noqa: F401
             except BaseException:
                 pass
-            for _, entry, overlay, sub_plan, all_cands in warm_jobs:
+            for _, entry, overlay, subtest_elig, all_cands in warm_jobs:
                 if verifier.get_children_cpu_seconds() >= max_verify_cpu_s or time.monotonic() >= wall_deadline:
                     break
                 passed, _ = verifier.verify_commit_fork(
-                    REF, overlay, sub_plan, all_cands, True, pack_cost_fn, dur_ms, num_to_id
+                    REF, overlay, subtest_elig, all_cands, cpu_info_active, duckdb_cache, pack_cost_fn, dur_ms, num_to_id
                 )
                 if passed:
                     entry[1].difference_update(passed)

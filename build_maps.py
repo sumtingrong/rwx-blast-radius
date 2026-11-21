@@ -497,28 +497,47 @@ def _collect_static_targets(repo_root: Path) -> set[str]:
         if fp.exists():
             targets.append(fp)
 
+    def _collect_from_body(body):
+        for item in body:
+            nm = None
+            val = None
+            if isinstance(item, ast.Assign) and item.targets and isinstance(item.targets[0], ast.Name):
+                nm = item.targets[0].id
+                val = item.value
+            elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                nm = item.target.id
+                val = item.value
+            if nm and nm.isupper() and not nm.startswith("_"):
+                if isinstance(val, ast.Dict):
+                    dict_attrs.add(nm)
+                else:
+                    attrs.add(nm)
+
     for p in targets:
         tree = ast.parse(p.read_text(encoding="utf-8"))
         for n in ast.walk(tree):
             if isinstance(n, ast.ClassDef):
-                for item in n.body:
-                    if isinstance(item, ast.Assign) and item.targets and isinstance(item.targets[0], ast.Name):
-                        nm = item.targets[0].id
-                        if nm.isupper() and not nm.startswith("_"):
-                            if isinstance(item.value, ast.Dict):
-                                dict_attrs.add(nm)
-                            else:
-                                attrs.add(nm)
-                    elif isinstance(item, ast.ClassDef):
-                        for sub in item.body:
-                            if isinstance(sub, ast.Assign) and sub.targets and isinstance(sub.targets[0], ast.Name):
-                                nm = sub.targets[0].id
-                                if nm.isupper() and not nm.startswith("_"):
-                                    if isinstance(sub.value, ast.Dict):
-                                        dict_attrs.add(nm)
-                                    else:
-                                        attrs.add(nm)
-    return attrs - dict_attrs - DERIVED_SOURCE_ATTRS - tok_names - {"NUMERIC_ESCAPES", "KEYWORDS", "SINGLE_TOKENS", "TRANSFORMS"}
+                _collect_from_body(n.body)
+
+    once_read_attrs: set[str] = set()
+    for p in (repo_root / "sqlglot").rglob("*.py"):
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name in ("__new__", "__init_subclass__", "_build_dispatch"):
+                for sub in ast.walk(n):
+                    if isinstance(sub, ast.Attribute) and sub.attr.isupper():
+                        once_read_attrs.add(sub.attr)
+                    elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isupper():
+                        once_read_attrs.add(sub.value)
+
+    return (
+        attrs
+        - dict_attrs
+        - DERIVED_SOURCE_ATTRS
+        - once_read_attrs
+        - tok_names
+        - {"NUMERIC_ESCAPES", "KEYWORDS", "SINGLE_TOKENS", "TRANSFORMS"}
+    )
 
 
 class _WorkerASTTransformer(ast.NodeTransformer):
@@ -1308,6 +1327,8 @@ def _trace_worker(args):
         "tests/test_optimizer.py::TestOptimizer::test_canonicalize": "check_file",
         "tests/test_optimizer.py::TestOptimizer::test_simplify": "check_file",
         "tests/test_optimizer.py::TestOptimizer::test_optimize": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_tpch": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries": "check_file",
     }
 
     import time
@@ -1589,6 +1610,266 @@ _HEAVY_TESTS = {
     "test_annotate_funcs",
     "test_recursion",
 }
+
+
+_CALIBRATE_TEST_IDS = (
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_agg_order",
+    "tests/test_executor.py::TestExecutor::test_subqueries",
+    "tests/test_executor.py::TestExecutor::test_scalar_functions",
+    "tests/test_optimizer.py::TestOptimizer::test_scope",
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
+    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries",
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_correlated_all",
+    "tests/test_optimizer.py::TestOptimizer::test_simplify",
+    "tests/test_optimizer.py::TestOptimizer::test_deep_ast_type_annotation",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_semi_anti_join_alias_shadowing_column",
+    "tests/test_optimizer.py::TestOptimizer::test_tpch",
+    "tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_scalar_subquery_predicates",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_uncorrelated_exists",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_special_joins",
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize_internal_names",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns_using_after_outer_join",
+    "tests/test_optimizer.py::TestOptimizer::test_values_annotation",
+    "tests/test_optimizer.py::TestOptimizer::test_simplify_string_comparisons",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_duckdb_collated_alias",
+    "tests/test_optimizer.py::TestOptimizer::test_merge_asof_join_inputs",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_source_types",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_distinct_on_predicates",
+    "tests/test_optimizer.py::TestOptimizer::test_eliminate_joins",
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+    "tests/test_serde.py::TestSerde::test_recursion",
+    "tests/test_serde.py::TestSerde::test_serde",
+    "tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake",
+    "tests/dialects/test_redshift.py::TestRedshift::test_values",
+    "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+    "tests/test_optimize_cross_joins.py::TestOptimizeCrossJoins::test_conditional_cross_joins",
+    "tests/test_expressions.py::TestExprs::test_is_star",
+    "tests/test_expressions.py::TestExprs::test_named_selects_long_by_name_chain",
+    "tests/test_expressions.py::TestExprs::test_hash_large_ast",
+    "tests/test_transpile.py::TestTranspile::test_identity",
+    "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb",
+    "tests/dialects/test_clickhouse.py::TestClickhouse::test_clickhouse",
+    "tests/dialects/test_dialect.py::TestDialect::test_initcap",
+    "tests/dialects/test_dialect.py::TestDialect::test_time",
+    "tests/dialects/test_postgres.py::TestPostgres::test_postgres",
+    "tests/test_parser.py::TestParser::test_is_precedence",
+    "tests/dialects/test_spark.py::TestSpark::test_spark",
+    "tests/test_build.py::TestBuild::test_build",
+    "tests/test_simplify_between.py::TestSimplifyBetween::test_symmetric_truth_values_and_grouping",
+)
+
+
+def _build_runtime_caches_worker(args):
+    """Run in a clean uninstrumented spawned process to build duckdb_cache.pkl and test_cpu.pkl."""
+    import csv
+    import time
+
+    repo_root_str, out_dir_str = args
+    repo_root = Path(repo_root_str).resolve()
+    out_dir = Path(out_dir_str).resolve()
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(repo_root)
+    sys.path.insert(0, str(repo_root))
+    concurrent.futures.ProcessPoolExecutor = _SyncPool
+
+    test_cpu_ms: dict[str, int] = {
+        "tests/test_parser.py::TestParser::test_max_nodes": 35000,
+    }
+    sub_times_ms: dict[str, list[int]] = {}
+    tpcds_tables_by_idx: dict[int, list[str]] = {}
+    tpcds_csv_ms: dict[str, int] = {}
+    opt_tpch_cache: list[tuple[str, str]] = []
+    tpcds_df_by_sql: dict[str, tuple[str, object]] = {}
+
+    # 1. Build DuckDB reference cache and calibrate TestExecutor TPC-DS/TPC-H
+    try:
+        import duckdb
+        import tests.test_executor as te
+        te.ProcessPoolExecutor = _SyncPool
+        from sqlglot import find_tables, parse_one, transpile
+        from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
+
+        tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        t0 = time.process_time()
+        for _, sql, opt in tpch_sqls:
+            opt_tpch_cache.append((transpile(sql, write="duckdb")[0], transpile(opt, write="duckdb")[0]))
+        opt_tpch_ms = max(25, round((time.process_time() - t0) * 1000))
+        test_cpu_ms["tests/test_executor.py::TestExecutor::test_optimized_tpch"] = opt_tpch_ms
+        per_h = max(1, round(opt_tpch_ms / max(1, len(tpch_sqls))))
+        sub_times_ms["tests/test_executor.py::TestExecutor::test_optimized_tpch"] = [per_h] * len(tpch_sqls)
+
+        tpcds_conn = duckdb.connect()
+        tpcds_tables = {}
+        for table, columns in TPCDS_SCHEMA.items():
+            fn = f"{te.DIR_TPCDS}{table}.csv.gz"
+            tpcds_conn.execute(
+                f"CREATE VIEW {table} AS SELECT * FROM READ_CSV('{fn}', delim='|', header=True, columns={columns})"
+            )
+            tc0 = time.process_time()
+            reader = csv.reader(te.open_file(fn), delimiter="|")
+            rows, ctypes = [], []
+            next(reader)
+            for row in reader:
+                if not ctypes:
+                    for v in row:
+                        try:
+                            ctypes.append(type(ast.literal_eval(v)))
+                        except (ValueError, SyntaxError):
+                            ctypes.append(str)
+                rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+            tpcds_tables[table] = te.Table(columns=columns, rows=rows)
+            tpcds_csv_ms[table] = max(1, round((time.process_time() - tc0) * 1000))
+
+        tpcds_sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        te.initializer(TPCDS_SCHEMA, tpcds_tables)
+        ds_sub_ms: list[int] = []
+        for idx_q, (meta, sql, _) in enumerate(tpcds_sqls):
+            if meta.get("execute"):
+                dsql = transpile(sql, write="duckdb")[0]
+                df = tpcds_conn.execute(dsql).fetchdf()
+                tpcds_df_by_sql[sql] = (dsql, df)
+                ast_q = parse_one(sql)
+                tpcds_tables_by_idx[idx_q] = sorted({t.name for t in find_tables(ast_q)})
+                tq0 = time.process_time()
+                p_ast = pickle.loads(pickle.dumps(parse_one(sql)))
+                p_args = pickle.loads(pickle.dumps(meta))
+                tbl = te.mp_execute(p_ast, p_args)
+                _ = pickle.loads(pickle.dumps(tbl))
+                _ = transpile(sql, write="duckdb")[0]
+                ds_sub_ms.append(max(5, round((time.process_time() - tq0) * 1000)))
+            else:
+                tq0 = time.process_time()
+                p_ast = pickle.loads(pickle.dumps(parse_one(sql)))
+                _ = pickle.loads(pickle.dumps(meta))
+                ds_sub_ms.append(max(1, round((time.process_time() - tq0) * 1000)))
+        tpcds_conn.close()
+        sub_times_ms["tests/test_executor.py::TestExecutor::test_execute_tpcds"] = ds_sub_ms
+        test_cpu_ms["tests/test_executor.py::TestExecutor::test_execute_tpcds"] = sum(ds_sub_ms)
+        sub_times_ms["tests/test_executor.py::TestExecutor::test_execute_tpch"] = [3] * len(tpch_sqls)
+    except Exception:
+        pass
+
+    # 2. Calibrate per-subtest CPU for test_generator_memory and TestOptimizer subtest loops
+    loaded_mods: dict = {}
+    setup_done: set = set()
+
+    def _get_cls(tid: str):
+        fpath, cls_name, meth = tid.split("::")
+        mod_name = fpath[:-3].replace("/", ".")
+        mod = loaded_mods.get(mod_name)
+        if mod is None:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "ProcessPoolExecutor"):
+                mod.ProcessPoolExecutor = _SyncPool
+            loaded_mods[mod_name] = mod
+        cls = getattr(mod, cls_name)
+        if (mod_name, cls_name) not in setup_done:
+            if cls_name == "TestExecutor":
+                cls.cache = {}
+                cls.tpch_tables = {}
+                cls.tpcds_tables = {}
+                cls.tpch_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+                cls.tpcds_sqls = list(mod.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            else:
+                cls.setUpClass()
+            setup_done.add((mod_name, cls_name))
+        return mod, cls, meth
+
+    try:
+        mod_g, cls_g, meth_g = _get_cls("tests/test_generator.py::TestGenerator::test_generator_memory")
+        orig_dialects = list(mod_g.Dialects)
+        gm_ms: list[int] = []
+        for d in orig_dialects:
+            mod_g.Dialects = [d]
+            t0 = time.process_time()
+            cls_g(meth_g).run(unittest.TestResult())
+            gm_ms.append(max(1, round((time.process_time() - t0) * 1000)))
+        mod_g.Dialects = orig_dialects
+        sub_times_ms["tests/test_generator.py::TestGenerator::test_generator_memory"] = gm_ms
+        test_cpu_ms["tests/test_generator.py::TestGenerator::test_generator_memory"] = sum(gm_ms)
+    except Exception:
+        pass
+
+    # Time optimizer subtest loops per-subtest AND record full test_cpu_ms
+    opt_sub_tids = (
+        "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+        "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+        "tests/test_optimizer.py::TestOptimizer::test_qualify_columns",
+        "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries",
+        "tests/test_optimizer.py::TestOptimizer::test_canonicalize",
+        "tests/test_optimizer.py::TestOptimizer::test_simplify",
+        "tests/test_optimizer.py::TestOptimizer::test_optimize",
+        "tests/test_optimizer.py::TestOptimizer::test_tpch",
+        "tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries",
+    )
+    for tid in opt_sub_tids:
+        try:
+            mod_o, cls_o, meth_o = _get_cls(tid)
+            orig_lfp = mod_o.load_sql_fixture_pairs
+            pair_starts: list[float] = []
+
+            def _timed_lfp(*a, **kw):
+                for item in orig_lfp(*a, **kw):
+                    pair_starts.append(time.process_time())
+                    yield item
+                pair_starts.append(time.process_time())
+
+            mod_o.load_sql_fixture_pairs = _timed_lfp
+            try:
+                t0 = time.process_time()
+                cls_o(meth_o).run(unittest.TestResult())
+                tot_ms = max(1, round((time.process_time() - t0) * 1000))
+            finally:
+                mod_o.load_sql_fixture_pairs = orig_lfp
+            test_cpu_ms[tid] = tot_ms
+            if len(pair_starts) >= 2:
+                per_item = [
+                    max(1, round((pair_starts[i + 1] - pair_starts[i]) * 1000))
+                    for i in range(len(pair_starts) - 1)
+                ]
+                sub_times_ms[tid] = per_item
+        except Exception:
+            pass
+
+    # 3. Time remaining top tests directly
+    for tid in _CALIBRATE_TEST_IDS:
+        if tid in test_cpu_ms:
+            continue
+        try:
+            _, cls_t, meth_t = _get_cls(tid)
+            t0 = time.process_time()
+            cls_t(meth_t).run(unittest.TestResult())
+            test_cpu_ms[tid] = max(1, round((time.process_time() - t0) * 1000))
+        except Exception:
+            pass
+
+    with open(out_dir / "duckdb_cache.pkl", "wb") as df_f:
+        pickle.dump(
+            {"opt_tpch": opt_tpch_cache, "tpcds_df_by_sql": tpcds_df_by_sql},
+            df_f,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    with open(out_dir / "test_cpu.pkl", "wb") as cf_f:
+        pickle.dump(
+            {
+                "test_cpu_ms": test_cpu_ms,
+                "sub_times_ms": sub_times_ms,
+                "tpcds_tables_by_idx": tpcds_tables_by_idx,
+                "tpcds_csv_ms": tpcds_csv_ms,
+            },
+            cf_f,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    return len(test_cpu_ms), len(sub_times_ms), len(tpcds_df_by_sql)
 
 
 def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> None:
@@ -1912,6 +2193,12 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         with open(out_path.parent / "subtest_map.pkl", "wb") as sm:
             pickle.dump(subtest_map, sm, protocol=pickle.HIGHEST_PROTOCOL)
 
+        with ctx.Pool(1) as cpool:
+            n_cpu_cal, n_sub_cal, n_duck_cal = cpool.apply(
+                _build_runtime_caches_worker,
+                ((str(repo_root), str(out_path.parent)),),
+            )
+
         index_payload = {
             "split": True,
             "nodeids": nodeids,
@@ -1938,6 +2225,11 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         }
         with open(out_path, "wb") as f:
             pickle.dump(index_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        extra_sz = sum(
+            (out_path.parent / fn).stat().st_size
+            for fn in ("duckdb_cache.pkl", "test_cpu.pkl")
+            if (out_path.parent / fn).exists()
+        )
         total_mb = (
             out_path.stat().st_size
             + (out_path.parent / "readers.pkl").stat().st_size
@@ -1946,10 +2238,11 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             + (out_path.parent / "cmp_diffs.pkl").stat().st_size
             + (out_path.parent / "scalar_attrs.pkl").stat().st_size
             + (out_path.parent / "subtest_map.pkl").stat().st_size
+            + extra_sz
             + sum(p.stat().st_size for p in meta_dir.iterdir())
         ) / 1e6
         print(
-            f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB, cmp_diffs={len(cmp_diff_to_idxs)}, falsy_diffs={len(falsy_diff_to_idxs)}, dict_keys={len(dict_key_to_idxs)}, scalar_attrs={len(scalar_attr_to_idxs)}, subtests={len(subtest_map)}) for {len(nodeids)} tests",
+            f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB, cmp_diffs={len(cmp_diff_to_idxs)}, falsy_diffs={len(falsy_diff_to_idxs)}, dict_keys={len(dict_key_to_idxs)}, scalar_attrs={len(scalar_attr_to_idxs)}, subtests={len(subtest_map)}, cal_cpu={n_cpu_cal}, cal_sub={n_sub_cal}, duck_df={n_duck_cal}) for {len(nodeids)} tests",
             flush=True,
         )
         return

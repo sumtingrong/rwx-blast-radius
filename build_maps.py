@@ -9,10 +9,12 @@ import ast
 import builtins
 import concurrent.futures
 import gzip
+import hashlib
 import importlib
 import json
 import multiprocessing
 import os
+import pickle
 import sys
 import unittest
 from collections import defaultdict
@@ -35,6 +37,10 @@ def iter_stmt_spans(node: ast.AST):
                 yield (child.lineno, child.test.end_lineno or child.lineno, child)
             else:
                 yield (child.lineno, child.lineno, child)
+            yield from iter_stmt_spans(child)
+        elif isinstance(child, ast.ExceptHandler):
+            end_ln = child.type.end_lineno if child.type else child.lineno
+            yield (child.lineno, end_ln or child.lineno, child)
             yield from iter_stmt_spans(child)
         elif isinstance(child, ast.stmt):
             yield (child.lineno, child.end_lineno or child.lineno, child)
@@ -63,38 +69,64 @@ def resolve_import(current_mod: str, is_pkg: bool, mod: str | None, level: int) 
     return [base] if base else []
 
 
+def ast_digest(tree: ast.AST) -> str:
+    return hashlib.blake2b(ast.dump(tree).encode("utf-8"), digest_size=16).hexdigest()
+
+
 def analyze_python_file(rel: str, src: str) -> dict:
     tree = ast.parse(src)
     mod_name = module_name_from_rel(rel)
     is_pkg = rel.endswith("/__init__.py")
+    src_lines = src.splitlines()
 
     imports = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("sqlglot"):
+                if alias.name.startswith(("sqlglot", "tests")):
                     imports.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
             for base_mod in resolve_import(mod_name, is_pkg, node.module, node.level):
-                if base_mod.startswith("sqlglot"):
+                if base_mod.startswith(("sqlglot", "tests")):
                     imports.add(base_mod)
                     for alias in node.names:
                         if alias.name != "*":
                             imports.add(f"{base_mod}.{alias.name}")
+                            if base_mod == "sqlglot.dialects":
+                                imports.add(f"sqlglot.dialects.{alias.name.lower()}")
 
     attr_reads = defaultdict(set)
     name_reads = defaultdict(set)
+    mod_attr_reads: set[str] = set()
+    mod_name_reads: set[str] = set()
 
     def walk_reads(node: ast.AST, in_func: bool) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             for ch in ast.iter_child_nodes(node):
                 walk_reads(ch, True)
             return
-        if in_func:
-            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            if in_func:
                 attr_reads[node.attr].add(node.lineno)
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            else:
+                mod_attr_reads.add(node.attr)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if in_func:
                 name_reads[node.id].add(node.lineno)
+            else:
+                mod_name_reads.add(node.id)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            if in_func:
+                attr_reads[node.args[1].value].add(node.lineno)
+            else:
+                mod_attr_reads.add(node.args[1].value)
         for ch in ast.iter_child_nodes(node):
             walk_reads(ch, in_func)
 
@@ -108,30 +140,41 @@ def analyze_python_file(rel: str, src: str) -> dict:
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            mark_lines(node.lineno, node.end_lineno, func=f"{node.name}@{node.lineno}", func_range=[node.lineno, node.end_lineno])
+            start_ln = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            mark_lines(
+                start_ln,
+                node.end_lineno,
+                func=node.name,
+                func_range=[start_ln, node.end_lineno],
+            )
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Lambda):
             mark_lines(node.lineno, node.end_lineno, is_lambda=True, lambda_range=[node.lineno, node.end_lineno])
 
+    def mark_class_body(cls_node: ast.ClassDef, qual_name: str) -> None:
+        for item in cls_node.body:
+            if isinstance(item, ast.ClassDef):
+                mark_class_body(item, f"{qual_name}.{item.name}")
+            elif isinstance(item, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                target_name = None
+                if isinstance(item, ast.Assign) and item.targets and isinstance(item.targets[0], ast.Name):
+                    target_name = item.targets[0].id
+                elif isinstance(item, (ast.AnnAssign, ast.AugAssign)) and isinstance(item.target, ast.Name):
+                    target_name = item.target.id
+                for ln in range(item.lineno, (item.end_lineno or item.lineno) + 1):
+                    info = line_info.get(ln, {})
+                    if not info.get("is_lambda") and not info.get("func"):
+                        line_info.setdefault(ln, {})["class_attr"] = [qual_name, target_name]
+
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, (ast.Assign, ast.AnnAssign)):
-                    target_name = None
-                    if isinstance(item, ast.Assign) and item.targets and isinstance(item.targets[0], ast.Name):
-                        target_name = item.targets[0].id
-                    elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-                        target_name = item.target.id
-                    for ln in range(item.lineno, (item.end_lineno or item.lineno) + 1):
-                        info = line_info.get(ln, {})
-                        if not info.get("is_lambda") and not info.get("func"):
-                            line_info.setdefault(ln, {})["class_attr"] = [node.name, target_name]
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            mark_class_body(node, node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             target_name = None
             if isinstance(node, ast.Assign) and node.targets and isinstance(node.targets[0], ast.Name):
                 target_name = node.targets[0].id
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
                 target_name = node.target.id
             for ln in range(node.lineno, (node.end_lineno or node.lineno) + 1):
                 info = line_info.get(ln, {})
@@ -152,13 +195,45 @@ def analyze_python_file(rel: str, src: str) -> dict:
                 if prev is None or (e - s) <= (prev[1] - prev[0]):
                     stmt_spans[ln] = [s, e]
 
+    # Map non-executing branch keyword lines (else:, try:, finally:) to their first body line
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try)):
+            for block in (
+                getattr(node, "orelse", ()),
+                getattr(node, "finalbody", ()),
+            ):
+                if block:
+                    first_stmt = block[0]
+                    # Search upward from first_stmt.lineno - 1 for else: / finally:
+                    for kw_ln in range(first_stmt.lineno - 1, node.lineno, -1):
+                        stripped = src_lines[kw_ln - 1].strip()
+                        if stripped in ("else:", "finally:"):
+                            stmt_spans.setdefault(kw_ln, [kw_ln, first_stmt.lineno])
+                            break
+            if isinstance(node, ast.Try) and node.body:
+                stmt_spans.setdefault(node.lineno, [node.lineno, node.body[0].lineno])
+
+    test_methods = []
+    if rel.startswith("tests/"):
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name != "Validator":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name.startswith("test_"):
+                        s_ln = item.decorator_list[0].lineno if item.decorator_list else item.lineno
+                        e_ln = item.end_lineno or item.lineno
+                        test_methods.append([node.name, item.name, s_ln, e_ln])
+
     return {
         "module": mod_name,
+        "ast_hash": ast_digest(tree),
         "imports": sorted(imports),
         "attr_reads": {k: sorted(v) for k, v in attr_reads.items()},
         "name_reads": {k: sorted(v) for k, v in name_reads.items()},
-        "line_info": {str(k): v for k, v in line_info.items()},
-        "stmt_spans": {str(k): v for k, v in stmt_spans.items()},
+        "mod_attr_reads": sorted(mod_attr_reads),
+        "mod_name_reads": sorted(mod_name_reads),
+        "line_info": line_info,
+        "stmt_spans": stmt_spans,
+        "test_methods": test_methods,
     }
 
 
@@ -168,7 +243,6 @@ class _SyncPool:
             initializer(*initargs)
 
     def submit(self, fn, *args, **kwargs):
-        import pickle
         fut = Future()
         try:
             p_args = pickle.loads(pickle.dumps(args))
@@ -198,7 +272,7 @@ def _discover_unittest_items(repo_root: Path) -> list[tuple[str, str, str]]:
         rel = p.relative_to(repo_root).as_posix()
         tree = ast.parse(p.read_text(encoding="utf-8"))
         for node in tree.body:
-            if isinstance(node, ast.ClassDef):
+            if isinstance(node, ast.ClassDef) and node.name != "Validator":
                 for item in node.body:
                     if isinstance(item, ast.FunctionDef) and item.name.startswith("test_"):
                         items.append((rel, node.name, item.name))
@@ -244,6 +318,12 @@ def _install_shims_if_needed():
     sys.modules["pandas.testing"] = testing_mod
 
 
+def _preimport_all_dialects():
+    import sqlglot.dialects as dialects_pkg
+    for dname in getattr(dialects_pkg, "DIALECTS", ()):
+        getattr(dialects_pkg, dname)
+
+
 def _trace_worker(args):
     repo_root_str, file_list = args
     repo_root = Path(repo_root_str)
@@ -252,27 +332,90 @@ def _trace_worker(args):
     _install_shims_if_needed()
     concurrent.futures.ProcessPoolExecutor = _SyncPool
 
+    # Pre-import all dialects before tracing so lazy imports don't blame unrelated tests
+    _preimport_all_dialects()
+
     sqlglot_root = str((repo_root / "sqlglot").resolve())
     fixtures_root = str((repo_root / "tests" / "fixtures").resolve())
 
-    # Hook Dialect.get_or_raise to track dialect classes used per test
     from sqlglot.dialects.dialect import Dialect
-    orig_get_or_raise = Dialect.get_or_raise.__func__
+    from sqlglot.tokens import Tokenizer
+    from sqlglot.parser import Parser
+    from sqlglot.generator import Generator
+
     current_dialects: set[str] = set()
     class_dialects: set[str] = set()
+    current_tok: set[str] = set()
+    class_tok: set[str] = set()
+    current_parse: set[str] = set()
+    class_parse: set[str] = set()
+    current_gen_init: set[str] = set()
+    class_gen_init: set[str] = set()
+    current_gen_sql: set[str] = set()
+    class_gen_sql: set[str] = set()
     active_test = False
+
+    def rec_set(target_cur, target_cls, name):
+        if active_test:
+            target_cur.add(name)
+        else:
+            target_cls.add(name)
+
+    orig_get_or_raise = Dialect.get_or_raise.__func__
 
     @classmethod
     def tracked_get_or_raise(cls, dialect):
         res = orig_get_or_raise(cls, dialect)
-        name = type(res).__name__
-        if active_test:
-            current_dialects.add(name)
-        else:
-            class_dialects.add(name)
+        rec_set(current_dialects, class_dialects, type(res).__name__)
         return res
 
     Dialect.get_or_raise = tracked_get_or_raise
+
+    orig_dialect_init = Dialect.__init__
+
+    def tracked_dialect_init(self, *a, **kw):
+        orig_dialect_init(self, *a, **kw)
+        rec_set(current_dialects, class_dialects, type(self).__name__)
+
+    Dialect.__init__ = tracked_dialect_init
+
+    orig_tok_init = Tokenizer.__init__
+
+    def tracked_tok_init(self, *a, **kw):
+        orig_tok_init(self, *a, **kw)
+        dn = type(self.dialect).__name__
+        rec_set(current_dialects, class_dialects, dn)
+        rec_set(current_tok, class_tok, dn)
+
+    Tokenizer.__init__ = tracked_tok_init
+
+    orig_parse_init = Parser.__init__
+
+    def tracked_parse_init(self, *a, **kw):
+        orig_parse_init(self, *a, **kw)
+        dn = type(self.dialect).__name__
+        rec_set(current_dialects, class_dialects, dn)
+        rec_set(current_parse, class_parse, dn)
+
+    Parser.__init__ = tracked_parse_init
+
+    orig_gen_init = Generator.__init__
+
+    def tracked_gen_init(self, *a, **kw):
+        orig_gen_init(self, *a, **kw)
+        dn = type(self.dialect).__name__
+        rec_set(current_dialects, class_dialects, dn)
+        rec_set(current_gen_init, class_gen_init, dn)
+
+    Generator.__init__ = tracked_gen_init
+
+    orig_gen_sql = Generator.sql
+
+    def tracked_gen_sql(self, *a, **kw):
+        rec_set(current_gen_sql, class_gen_sql, type(self.dialect).__name__)
+        return orig_gen_sql(self, *a, **kw)
+
+    Generator.sql = tracked_gen_sql
 
     # Hook open / gzip.open to track fixtures opened per test and per class
     orig_open = builtins.open
@@ -367,7 +510,7 @@ def _trace_worker(args):
             return None
 
     import time
-    results = []  # list of (nodeid, lines_list, fixtures_list, dialects_list)
+    results = []
     for file_path, cls_items in file_list:
         mod_name = file_path[:-3].replace("/", ".")
         mod = importlib.import_module(mod_name)
@@ -384,6 +527,10 @@ def _trace_worker(args):
                 continue
             class_fixtures.clear()
             class_dialects.clear()
+            class_tok.clear()
+            class_parse.clear()
+            class_gen_init.clear()
+            class_gen_sql.clear()
             active_test = False
             if hasattr(cls, "setUpClass"):
                 try:
@@ -392,12 +539,20 @@ def _trace_worker(args):
                     pass
             saved_class_fixtures = set(class_fixtures)
             saved_class_dialects = set(class_dialects)
+            saved_class_tok = set(class_tok)
+            saved_class_parse = set(class_parse)
+            saved_class_gen_init = set(class_gen_init)
+            saved_class_gen_sql = set(class_gen_sql)
 
             for meth_name in meths:
                 nodeid = f"{file_path}::{cls_name}::{meth_name}"
                 current_lines.clear()
                 current_fixtures.clear()
                 current_dialects.clear()
+                current_tok.clear()
+                current_parse.clear()
+                current_gen_init.clear()
+                current_gen_sql.clear()
                 inst = cls(meth_name)
                 active_test = True
                 trace_hits = 0
@@ -428,8 +583,16 @@ def _trace_worker(args):
                         if "tpc-ds" in fx and "tpcds" not in meth_name:
                             continue
                     all_fx.add(fx)
-                all_dl = sorted(current_dialects | saved_class_dialects)
-                results.append((nodeid, [f"{r}:{ln}" for r, ln in current_lines], sorted(all_fx), all_dl))
+                results.append((
+                    nodeid,
+                    [f"{r}:{ln}" for r, ln in current_lines],
+                    sorted(all_fx),
+                    sorted(current_dialects | saved_class_dialects),
+                    sorted(current_tok | saved_class_tok),
+                    sorted(current_parse | saved_class_parse),
+                    sorted(current_gen_init | saved_class_gen_init),
+                    sorted(current_gen_sql | saved_class_gen_sql),
+                ))
 
             if hasattr(cls, "tearDownClass"):
                 try:
@@ -445,6 +608,11 @@ def _trace_worker(args):
     builtins.open = orig_open
     gzip.open = orig_gzip_open
     Dialect.get_or_raise = orig_get_or_raise
+    Dialect.__init__ = orig_dialect_init
+    Tokenizer.__init__ = orig_tok_init
+    Parser.__init__ = orig_parse_init
+    Generator.__init__ = orig_gen_init
+    Generator.sql = orig_gen_sql
     return results
 
 
@@ -452,7 +620,6 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
     items = _discover_unittest_items(repo_root)
     n_workers = workers or min(8, os.cpu_count() or 4)
     buckets_map = [defaultdict(list) for _ in range(n_workers)]
-    # Distribute individual test methods round-robin across workers so heavy files parallelize!
     for i, (rel, cls_name, meth_name) in enumerate(items):
         buckets_map[i % n_workers][rel].append((cls_name, meth_name))
     buckets = [sorted(b.items()) for b in buckets_map if b]
@@ -462,38 +629,49 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         worker_outputs = pool.map(_trace_worker, [(str(repo_root), b) for b in buckets if b])
 
     nodeids = []
-    nodeid_to_idx = {}
-    line_to_idxs = defaultdict(list)
-    fixture_to_idxs = defaultdict(list)
-    dialect_to_idxs = defaultdict(list)
+    line_to_idxs = defaultdict(set)
+    fixture_to_idxs = defaultdict(set)
+    dialect_to_idxs = defaultdict(set)
+    tok_to_idxs = defaultdict(set)
+    parse_to_idxs = defaultdict(set)
+    gen_init_to_idxs = defaultdict(set)
+    gen_sql_to_idxs = defaultdict(set)
 
     for wout in worker_outputs:
-        for nodeid, lines, fxs, dls in wout:
+        for nodeid, lines, fxs, dls, toks, parses, ginits, gsqls in wout:
             idx = len(nodeids)
             nodeids.append(nodeid)
-            nodeid_to_idx[nodeid] = idx
             for loc in lines:
-                line_to_idxs[loc].append(idx)
+                line_to_idxs[loc].add(idx)
             for fx in fxs:
-                fixture_to_idxs[fx].append(idx)
+                fixture_to_idxs[fx].add(idx)
             for dl in dls:
-                dialect_to_idxs[dl].append(idx)
+                dialect_to_idxs[dl].add(idx)
+            for t in toks:
+                tok_to_idxs[t].add(idx)
+            for p in parses:
+                parse_to_idxs[p].add(idx)
+            for gi in ginits:
+                gen_init_to_idxs[gi].add(idx)
+            for gs in gsqls:
+                gen_sql_to_idxs[gs].add(idx)
 
     # Static AST + inheritance analysis
     sys.path.insert(0, str(repo_root))
+    _preimport_all_dialects()
     from sqlglot.dialects.dialect import Dialect, Dialects
+    from sqlglot.tokens import Tokenizer
+    from sqlglot.parser import Parser
+    from sqlglot.generator import Generator
 
     dialect_subclasses = defaultdict(set)
     parser_subclasses = defaultdict(set)
     generator_subclasses = defaultdict(set)
-    # Walk all registered dialects in Dialect._classes plus Dialects enum
-    seen_dialect_cls = set()
+    tokenizer_subclasses = defaultdict(set)
+
+    seen_dialect_cls = set(Dialect.classes.values())
     for d in Dialects:
-        inst = Dialect.get_or_raise(d)
-        seen_dialect_cls.add(type(inst))
-    for cls_obj in Dialect.__subclasses__():
-        seen_dialect_cls.add(cls_obj)
-    # BFS subclasses
+        seen_dialect_cls.add(type(Dialect.get_or_raise(d)))
     stack = list(seen_dialect_cls)
     while stack:
         c = stack.pop()
@@ -508,86 +686,138 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             inst = d_cls()
             p_cls = type(inst.parser())
             g_cls = type(inst.generator())
+            t_cls = type(inst.tokenizer())
+            jt_cls = getattr(d_cls, "jsonpath_tokenizer_class", None)
         except Exception:
             p_cls = None
             g_cls = None
+            t_cls = None
+            jt_cls = None
         for base in d_cls.__mro__:
             if issubclass(base, Dialect):
                 dialect_subclasses[base.__name__].add(d_name)
         if p_cls is not None:
             for base in p_cls.__mro__:
-                if base.__name__.endswith("Parser"):
+                if issubclass(base, Parser):
                     parser_subclasses[base.__name__].add(d_name)
         if g_cls is not None:
             for base in g_cls.__mro__:
-                if base.__name__.endswith("Generator"):
+                if issubclass(base, Generator):
                     generator_subclasses[base.__name__].add(d_name)
+        for tc in (t_cls, jt_cls):
+            if tc is not None:
+                for base in tc.__mro__:
+                    if isinstance(base, type) and issubclass(base, Tokenizer):
+                        tokenizer_subclasses[base.__qualname__].add(d_name)
+                        if base.__name__ not in ("Tokenizer", "JSONPathTokenizer"):
+                            tokenizer_subclasses[base.__name__].add(d_name)
 
     mod_to_file = {}
     file_data = {}
     attr_readers = defaultdict(list)
     name_readers = defaultdict(list)
+    mod_attr_readers = defaultdict(set)
+    mod_name_readers = defaultdict(set)
 
-    for p in sorted((repo_root / "sqlglot").rglob("*.py")):
+    all_py = list(sorted((repo_root / "sqlglot").rglob("*.py"))) + list(sorted((repo_root / "tests").rglob("*.py")))
+    for p in all_py:
         rel = p.relative_to(repo_root).as_posix()
         src = p.read_text(encoding="utf-8")
         info = analyze_python_file(rel, src)
         file_data[rel] = info
         mod_to_file[info["module"]] = rel
-        for attr, lns in info["attr_reads"].items():
-            for ln in lns:
-                attr_readers[attr].append(f"{rel}:{ln}")
-        for nm, lns in info["name_reads"].items():
-            for ln in lns:
-                name_readers[nm].append(f"{rel}:{ln}")
+        if rel.startswith("sqlglot/"):
+            for attr, lns in info["attr_reads"].items():
+                for ln in lns:
+                    attr_readers[attr].append(f"{rel}:{ln}")
+            for nm, lns in info["name_reads"].items():
+                for ln in lns:
+                    name_readers[nm].append(f"{rel}:{ln}")
+            for attr in info["mod_attr_reads"]:
+                mod_attr_readers[attr].add(rel)
+            for nm in info["mod_name_reads"]:
+                mod_name_readers[nm].add(rel)
 
-    # Strip attr_reads / name_reads from file_data to keep map compact
+    # Transitive dependency mapping for every python file (sqlglot + tests)
+    # reverse_importers[target_rel] = all rels that transitively import target_rel
+    direct_deps: dict[str, set[str]] = {}
+    for rel, info in file_data.items():
+        deps = set()
+        for imp in info["imports"]:
+            if imp in mod_to_file:
+                deps.add(mod_to_file[imp])
+            else:
+                # e.g. sqlglot.helper.seq_get -> sqlglot.helper
+                parts = imp.split(".")
+                for k in range(len(parts) - 1, 0, -1):
+                    cand = ".".join(parts[:k])
+                    if cand in mod_to_file:
+                        deps.add(mod_to_file[cand])
+                        break
+        direct_deps[rel] = deps
+
+    file_dep_closure: dict[str, set[str]] = {}
+    for rel in file_data:
+        seen = set(direct_deps.get(rel, ()))
+        st = list(seen)
+        while st:
+            cur = st.pop()
+            for dep in direct_deps.get(cur, ()):
+                if dep not in seen:
+                    seen.add(dep)
+                    st.append(dep)
+        file_dep_closure[rel] = seen
+
     compact_file_data = {}
     for rel, info in file_data.items():
         compact_file_data[rel] = {
-            "module": info["module"],
-            "imports": info["imports"],
+            "ast_hash": info["ast_hash"],
             "line_info": info["line_info"],
             "stmt_spans": info["stmt_spans"],
+            "test_methods": info["test_methods"],
         }
-
-    test_file_imports = {}
-    for p in sorted((repo_root / "tests").rglob("test_*.py")):
-        tf = p.relative_to(repo_root).as_posix()
-        info = analyze_python_file(tf, p.read_text(encoding="utf-8"))
-        direct = {mod_to_file[imp] for imp in info["imports"] if imp in mod_to_file}
-        seen = set(direct)
-        st = list(direct)
-        while st:
-            cur = st.pop()
-            for imp in file_data[cur]["imports"]:
-                target = mod_to_file.get(imp)
-                if target and target not in seen:
-                    seen.add(target)
-                    st.append(target)
-        test_file_imports[tf] = sorted(seen)
 
     payload = {
         "nodeids": nodeids,
         "line_to_idxs": dict(line_to_idxs),
         "fixture_to_idxs": dict(fixture_to_idxs),
         "dialect_to_idxs": dict(dialect_to_idxs),
-        "dialect_subclasses": {k: sorted(v) for k, v in dialect_subclasses.items()},
-        "parser_subclasses": {k: sorted(v) for k, v in parser_subclasses.items()},
-        "generator_subclasses": {k: sorted(v) for k, v in generator_subclasses.items()},
+        "tok_to_idxs": dict(tok_to_idxs),
+        "parse_to_idxs": dict(parse_to_idxs),
+        "gen_init_to_idxs": dict(gen_init_to_idxs),
+        "gen_sql_to_idxs": dict(gen_sql_to_idxs),
+        "dialect_subclasses": dict(dialect_subclasses),
+        "parser_subclasses": dict(parser_subclasses),
+        "generator_subclasses": dict(generator_subclasses),
+        "tokenizer_subclasses": dict(tokenizer_subclasses),
         "file_data": compact_file_data,
         "attr_readers": dict(attr_readers),
         "name_readers": dict(name_readers),
-        "test_file_imports": test_file_imports,
+        "mod_attr_readers": {k: sorted(v) for k, v in mod_attr_readers.items()},
+        "mod_name_readers": {k: sorted(v) for k, v in mod_name_readers.items()},
+        "file_deps": file_dep_closure,
     }
 
-    with gzip.open(out_path, "wt", encoding="utf-8") as f:
-        json.dump(payload, f, separators=(",", ":"))
+    if out_path.suffix == ".pkl":
+        with open(out_path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        # JSON fallback for inspection
+        json_payload = {
+            k: (
+                {kk: sorted(vv) for kk, vv in v.items()}
+                if isinstance(v, dict) and v and isinstance(next(iter(v.values())), set)
+                else v
+            )
+            for k, v in payload.items()
+        }
+        with gzip.open(out_path, "wt", encoding="utf-8") as f:
+            json.dump(json_payload, f, separators=(",", ":"))
     print(f"Built {out_path} ({out_path.stat().st_size / 1e6:.2f} MB) for {len(nodeids)} tests", flush=True)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: build_maps.py <sqlglot_repo_dir> <out_maps.json.gz>", file=sys.stderr)
+        print("Usage: build_maps.py <sqlglot_repo_dir> <out_maps.pkl|out_maps.json.gz>", file=sys.stderr)
         sys.exit(2)
     build_all(Path(sys.argv[1]), Path(sys.argv[2]))

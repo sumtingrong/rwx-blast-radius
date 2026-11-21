@@ -536,14 +536,16 @@ def main() -> None:
                             for loc in reader_locs:
                                 r_rel, r_ln_str = loc.rsplit(":", 1)
                                 selected.update(tests_for_line_or_span(r_rel, int(r_ln_str)))
-                            if not is_expr_class_attr and attr_name:
-                                for mrel in mod_attr_readers.get(attr_name, ()):
-                                    if mrel in importers_of_rel:
-                                        selected.update(file_importers.get(mrel, ()))
-                            if cls_name:
-                                for mrel in mod_attr_readers.get(cls_name, ()):
-                                    if mrel in importers_of_rel:
-                                        selected.update(file_importers.get(mrel, ()))
+                            if attr_name:
+                                mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
+                                if is_expr_class_attr and cls_name:
+                                    # e.g. UNMERGABLE_ARGS = set(exp.Select.arg_types) accesses both cls_name and attr_name
+                                    mod_cls_set = set(mod_attr_readers.get(cls_name, ())) | set(mod_name_readers.get(cls_name, ()))
+                                    mod_matches = mod_attr_set & mod_cls_set & importers_of_rel
+                                else:
+                                    mod_matches = mod_attr_set & importers_of_rel
+                                for mrel in mod_matches:
+                                    selected.update(file_importers.get(mrel, ()))
                         elif not is_expr_class_attr:
                             selected.update(file_cov_tests.get(rel, ()))
                     elif "module_var" in info:

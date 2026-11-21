@@ -35,3 +35,4 @@ jobs:
                   if missed:
                       print(f"    MISSED: {[tests[m]['id'] for m in sorted(missed)]}")
           PY
+          docker run --rm --platform linux/amd64 --network none --cpus 2 --memory 4096m --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --user 65534:65534 --env HOME=/tmp --volume $(pwd)/sample/commits:/data/commits:ro --volume $(pwd)/sample/tests.json:/data/tests.json:ro --entrypoint python blast-radius-entry -c "import resource, selector; selector.main(); r = resource.getrusage(resource.RUSAGE_SELF); import sys; print(f'CONTAINER_CPU_TIME={r.ru_utime + r.ru_stime:.3f}s', file=sys.stderr)" > /dev/null

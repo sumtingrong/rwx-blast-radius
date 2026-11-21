@@ -457,6 +457,7 @@ def main() -> None:
     scalar_attr_to_tests = make_lazy_dict(maps.get("scalar_attr_to_idxs", {}))
     cls_sub_qualnames = maps.get("cls_sub_qualnames", {})
     tracked_dicts = {tuple(x) for x in maps.get("tracked_dicts", ())}
+    test_dict_readers = maps.get("test_dict_readers", {})
     scalar_attrs = set(maps.get("scalar_attrs", ()))
 
     if is_split:
@@ -830,7 +831,7 @@ def main() -> None:
             if use_ast_diff and not mismatch:
                 for ln, col, op_name in cmp_swaps:
                     linfo = get_line_info(rel, ln)
-                    if linfo.get("func") or linfo.get("is_lambda"):
+                    if (linfo.get("func") and linfo["func"] not in ONCE_FUNCS) or linfo.get("is_lambda"):
                         selected.update(cmp_diff_to_tests.get(f"{rel}:{ln}:{col}:{op_name}", ()))
                     else:
                         other_spans.append((ln, ln))
@@ -850,6 +851,9 @@ def main() -> None:
                                     k_idxs = dk_map.get(f"{sub_c}|{attr_name}|{kt}")
                                     if k_idxs:
                                         selected.update(remap_idxs(k_idxs))
+                            for loc in test_dict_readers.get(attr_name, ()):
+                                r_rel, r_ln_str = loc.rsplit(":", 1)
+                                selected.update(tests_for_test_line(r_rel, int(r_ln_str)))
                         else:
                             other_spans.append((d_ln, d_end_ln))
 

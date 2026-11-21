@@ -1317,6 +1317,8 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
     mod_attr_readers = defaultdict(set)
     mod_name_readers = defaultdict(set)
     defined_symbols: set[str] = set()
+    tracked_dict_attrs = {a for _, a in tracked_dicts}
+    test_dict_readers: dict[str, list[str]] = defaultdict(list)
 
     all_py = list(sorted((repo_root / "sqlglot").rglob("*.py"))) + list(sorted((repo_root / "tests").rglob("*.py")))
     for p in all_py:
@@ -1351,6 +1353,9 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
                 if attr in scalar_attrs:
                     for ln in lns:
                         attr_readers[attr].append(f"{rel}:{ln}")
+                if attr in tracked_dict_attrs:
+                    for ln in lns:
+                        test_dict_readers[attr].append(f"{rel}:{ln}")
 
     # Transitive dependency mapping for every python file (sqlglot + tests)
     # reverse_importers[target_rel] = all rels that transitively import target_rel
@@ -1445,6 +1450,7 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             "tokenizer_subclasses": dict(tokenizer_subclasses),
             "cls_sub_qualnames": {k: sorted(v) for k, v in cls_sub_qualnames.items()},
             "tracked_dicts": sorted(tracked_dicts),
+            "test_dict_readers": dict(test_dict_readers),
             "scalar_attrs": sorted(scalar_attrs),
             "scalar_attr_to_idxs": dict(scalar_attr_to_idxs),
             "cmp_diff_to_idxs": dict(cmp_diff_to_idxs),

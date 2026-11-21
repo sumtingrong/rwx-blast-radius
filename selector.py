@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import gzip
 import hashlib
 import json
@@ -9,6 +10,7 @@ import os
 import pickle
 import re
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -594,6 +596,7 @@ def analyze_diff_asts(
     falsy_swaps = []
     dict_diffs = []
     other_spans = []
+    extra_anchors: list[int] = []
     allow_bool_builtin = not (_is_bool_shadowed(old_tree) or _is_bool_shadowed(new_tree))
 
     def walk_cmp(o: ast.AST, n: ast.AST, cls_stack: list[str], in_func: bool, bool_ctx: bool) -> bool:
@@ -682,6 +685,9 @@ def analyze_diff_asts(
                     return walk_cmp(o.value, n.value, cls_stack, True, False)
 
         if type(o) is not type(n):
+            if in_func and hasattr(o, "lineno"):
+                other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                return True
             return False
 
         # 6. ImportFrom alias reordering (same module & level, same set of (name, asname))
@@ -847,6 +853,52 @@ def analyze_diff_asts(
                     ov = _clean_stmts(ov, strip_doc=(strip_body_doc and field == "body"), strip_overloads=ignore_annotations)
                     nv = _clean_stmts(nv, strip_doc=(strip_body_doc and field == "body"), strip_overloads=ignore_annotations)
                 if len(ov) != len(nv):
+                    if child_in_func and field in ("body", "orelse", "finalbody"):
+                        p = 0
+                        m_len = min(len(ov), len(nv))
+                        while p < m_len and ast_equal(ov[p], nv[p]):
+                            p += 1
+                        s = 0
+                        while s < m_len - p and ast_equal(ov[len(ov) - 1 - s], nv[len(nv) - 1 - s]):
+                            s += 1
+                        if p + s < len(ov):
+                            s_ln = getattr(ov[p], "lineno", None)
+                            e_node = ov[len(ov) - 1 - s]
+                            e_ln = getattr(e_node, "end_lineno", None) or getattr(e_node, "lineno", None)
+                            if s_ln is not None and e_ln is not None:
+                                other_spans.append((s_ln, e_ln))
+                                continue
+                        else:
+                            # Pure insertion inside a function block: anchor both enclosing header & neighbors
+                            added_anchor = False
+                            if p == 0:
+                                if hasattr(o, "lineno"):
+                                    other_spans.append((o.lineno, o.lineno))
+                                    extra_anchors.append(o.lineno)
+                                    added_anchor = True
+                                if ov and hasattr(ov[0], "lineno"):
+                                    other_spans.append((ov[0].lineno, getattr(ov[0], "end_lineno", None) or ov[0].lineno))
+                                    extra_anchors.append(ov[0].lineno)
+                                    added_anchor = True
+                            else:
+                                prev_n = ov[p - 1]
+                                if hasattr(prev_n, "lineno"):
+                                    other_spans.append((prev_n.lineno, getattr(prev_n, "end_lineno", None) or prev_n.lineno))
+                                    extra_anchors.append(prev_n.lineno)
+                                    added_anchor = True
+                                if p < len(ov) and hasattr(ov[p], "lineno"):
+                                    other_spans.append((ov[p].lineno, getattr(ov[p], "end_lineno", None) or ov[p].lineno))
+                                    extra_anchors.append(ov[p].lineno)
+                                    added_anchor = True
+                                elif hasattr(o, "lineno"):
+                                    other_spans.append((o.lineno, o.lineno))
+                                    extra_anchors.append(o.lineno)
+                                    added_anchor = True
+                            if added_anchor:
+                                continue
+                    elif in_func and hasattr(o, "lineno"):
+                        other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                        continue
                     return False
                 for oi, ni in zip(ov, nv):
                     if isinstance(oi, ast.AST) and isinstance(ni, ast.AST):
@@ -868,7 +920,7 @@ def analyze_diff_asts(
         return True
 
     ok = walk_cmp(old_tree, new_tree, [], False, False)
-    return cmp_swaps, falsy_swaps, dict_diffs, other_spans, not ok
+    return cmp_swaps, falsy_swaps, dict_diffs, other_spans, extra_anchors, not ok
 
 
 def _strip_new_test_methods(new_tree: ast.AST, rel: str, id_to_num: dict[str, int]) -> ast.AST:
@@ -1071,6 +1123,15 @@ def pack_workers(test_nums: set[int], dur_ms: dict[int, int]) -> list[list[int]]
     return [w for w in best_workers if w]
 
 
+def pack_cost(test_nums: set[int], dur_ms: dict[int, int]) -> int:
+    if not test_nums:
+        return 0
+    workers = pack_workers(test_nums, dur_ms)
+    if not workers:
+        return 0
+    return max(sum(dur_ms[t] for t in w) for w in workers) + 2000 * len(workers)
+
+
 def _load_root(path: Path) -> dict:
     if path.suffix == ".pkl":
         with open(path, "rb") as f:
@@ -1082,6 +1143,7 @@ def _load_root(path: Path) -> dict:
 def main() -> None:
     tests_raw = json.loads((DATA / "tests.json").read_text("utf-8"))["tests"]
     id_to_num = {t["id"]: t["number"] for t in tests_raw}
+    num_to_id = {t["number"]: t["id"] for t in tests_raw}
     dur_ms = {t["number"]: round(t["seconds"] * 1000) for t in tests_raw}
     tests_by_file: dict[str, list[int]] = defaultdict(list)
     for t in tests_raw:
@@ -1405,8 +1467,36 @@ def main() -> None:
                 return tests_for_line_or_span(r_rel, r_ln)
         return set(tests_by_file.get(r_rel, ())) or file_importers.get(r_rel, set())
 
-    def select_for_patch(patch_text: str) -> set[int]:
+    _subtest_map_cache: dict | None = None
+
+    def get_subtest_map() -> dict:
+        nonlocal _subtest_map_cache
+        if _subtest_map_cache is None:
+            sm_path = maps_dir / "subtest_map.pkl"
+            if sm_path.exists():
+                with open(sm_path, "rb") as smf:
+                    _subtest_map_cache = pickle.load(smf)
+            else:
+                _subtest_map_cache = maps.get("subtest_map", {})
+        return _subtest_map_cache
+
+    def select_for_patch(patch_text: str) -> tuple[set[int], dict]:
         selected: set[int] = set()
+        touch_info: dict = {
+            "subtest_eligible": True,
+            "touched_lines": set(),
+            "touched_dicts": set(),
+            "touched_attrs": set(),
+        }
+
+        def record_line_or_span(r_rel: str, r_ln: int) -> None:
+            t_lines = touch_info["touched_lines"]
+            t_lines.add((r_rel, r_ln))
+            span = get_stmt_span(r_rel, r_ln)
+            if span:
+                for sln in range(span[0], span[1] + 1):
+                    t_lines.add((r_rel, sln))
+
         for fdiff in parse_patch(patch_text):
             rel = fdiff["new_path"] or fdiff["old_path"]
             if not rel:
@@ -1428,6 +1518,7 @@ def main() -> None:
                     if not non_comment:
                         continue
 
+                touch_info["subtest_eligible"] = False
                 fx_tests = fixture_to_tests.get(rel)
                 if fx_tests:
                     selected.update(fx_tests)
@@ -1445,6 +1536,7 @@ def main() -> None:
             if rel.startswith("tests/"):
                 default_test_fallback = file_importers.get(rel, set() if rel in file_deps else all_test_nums)
                 if not rel.endswith(".py") or fdiff["new_file"] or fdiff["deleted_file"]:
+                    touch_info["subtest_eligible"] = False
                     selected.update(default_test_fallback)
                     continue
 
@@ -1452,6 +1544,7 @@ def main() -> None:
                     continue
 
                 t_other_spans: list[tuple[int, int]] = []
+                t_extra_anchors: list[int] = []
                 t_mismatch = False
                 t_use_ast = False
 
@@ -1461,13 +1554,14 @@ def main() -> None:
                     try:
                         new_ast = ast.parse(patched_src)
                     except SyntaxError:
+                        touch_info["subtest_eligible"] = False
                         selected.update(default_test_fallback)
                         continue
                     old_ast = get_orig_ast(rel, orig_src)
                     if ast_equal(old_ast, new_ast):
                         continue
                     stripped_new_ast = _strip_new_test_methods(new_ast, rel, id_to_num)
-                    _, _, _, t_other_spans, t_mismatch = analyze_diff_asts(
+                    _, _, _, t_other_spans, t_extra_anchors, t_mismatch = analyze_diff_asts(
                         old_ast,
                         stripped_new_ast,
                         ignore_annotations=has_future_annotations(old_ast),
@@ -1475,10 +1569,11 @@ def main() -> None:
                         rel=rel,
                         exported_syms=imported_from_file.get(rel, ()),
                     )
-                    if not t_mismatch and not t_other_spans:
+                    if not t_mismatch and not t_other_spans and not t_extra_anchors:
                         continue
                     t_use_ast = True
 
+                touch_info["subtest_eligible"] = False
                 test_methods = get_test_methods(rel)
                 if rel in tests_by_file and test_methods:
                     matched_tests: set[int] = set()
@@ -1528,6 +1623,18 @@ def main() -> None:
                                     break
                         if not all_inside_test_methods:
                             break
+                    if all_inside_test_methods and t_extra_anchors:
+                        for ln in t_extra_anchors:
+                            hit = None
+                            for cls_n, meth_n, s_ln, e_ln in test_methods:
+                                if s_ln <= ln <= e_ln:
+                                    hit = f"{rel}::{cls_n}::{meth_n}"
+                                    break
+                            if hit and hit in id_to_num:
+                                matched_tests.add(id_to_num[hit])
+                            else:
+                                all_inside_test_methods = False
+                                break
                     if all_inside_test_methods and matched_tests:
                         selected.update(matched_tests)
                         continue
@@ -1554,6 +1661,8 @@ def main() -> None:
                             touched_old_lines = [ln for ln in touched_old_lines if any(s <= ln <= e for s, e in t_other_spans)]
                             insertion_anchors = [ln for ln in insertion_anchors if any((s - 1) <= ln <= (e + 1) for s, e in t_other_spans)]
                         candidate_lines = touched_old_lines if touched_old_lines else insertion_anchors
+                        if t_use_ast and not t_mismatch and t_extra_anchors:
+                            candidate_lines = list(dict.fromkeys([*candidate_lines, *t_extra_anchors]))
                         for ln in candidate_lines:
                             if ln < 1:
                                 continue
@@ -1630,6 +1739,7 @@ def main() -> None:
             # 3. Non-sqlglot files
             if not rel.startswith("sqlglot/"):
                 if "sqlglotc" in rel:
+                    touch_info["subtest_eligible"] = False
                     selected.update(tests_by_file.get("tests/test_sqlglotc.py", ()))
                 continue
 
@@ -1637,6 +1747,7 @@ def main() -> None:
                 continue
 
             if fdiff["new_file"] or fdiff["deleted_file"]:
+                touch_info["subtest_eligible"] = False
                 selected.update(file_importers.get(rel, all_test_nums))
                 continue
 
@@ -1649,6 +1760,7 @@ def main() -> None:
             falsy_swaps = []
             dict_diffs = []
             other_spans: list[tuple[int, int]] = []
+            extra_anchors: list[int] = []
             mismatch = False
             use_ast_diff = False
 
@@ -1656,6 +1768,7 @@ def main() -> None:
                 try:
                     new_ast = ast.parse(patched_src)
                 except SyntaxError:
+                    touch_info["subtest_eligible"] = False
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
                 old_ast = get_orig_ast(rel, orig_src)
@@ -1663,7 +1776,7 @@ def main() -> None:
                     selected.update(tests_by_file.get("tests/test_typing.py", ()))
                 ignore_ann = (rel not in _RUNTIME_ANN_FILES) and has_future_annotations(old_ast)
                 block_class_ann = rel in _CLASS_ANN_FILES
-                cmp_swaps, falsy_swaps, dict_diffs, other_spans, mismatch = analyze_diff_asts(
+                cmp_swaps, falsy_swaps, dict_diffs, other_spans, extra_anchors, mismatch = analyze_diff_asts(
                     old_ast,
                     new_ast,
                     ignore_annotations=ignore_ann,
@@ -1671,15 +1784,19 @@ def main() -> None:
                     rel=rel,
                     exported_syms=imported_from_file.get(rel, ()),
                 )
-                if not mismatch and not cmp_swaps and not falsy_swaps and not dict_diffs and not other_spans:
+                if not mismatch and not cmp_swaps and not falsy_swaps and not dict_diffs and not other_spans and not extra_anchors:
                     continue
                 use_ast_diff = True
             elif rel.startswith("sqlglot/typing/"):
                 selected.update(tests_by_file.get("tests/test_typing.py", ()))
 
             if not has_file(rel):
+                touch_info["subtest_eligible"] = False
                 selected.update(all_test_nums)
                 continue
+
+            if not use_ast_diff or mismatch:
+                touch_info["subtest_eligible"] = False
 
             if use_ast_diff and not mismatch:
                 if cmp_swaps:
@@ -1687,6 +1804,7 @@ def main() -> None:
                     for ln, col, op_name in cmp_swaps:
                         linfo = get_line_info(rel, ln)
                         if (linfo.get("func") and linfo["func"] not in ONCE_FUNCS) or linfo.get("is_lambda"):
+                            record_line_or_span(rel, ln)
                             idxs = cd_map.get(f"{rel}:{ln}:{col}:{op_name}")
                             if idxs:
                                 selected.update(remap_idxs(idxs))
@@ -1698,6 +1816,7 @@ def main() -> None:
                     for ln, col, kind in falsy_swaps:
                         linfo = get_line_info(rel, ln)
                         if (linfo.get("func") and linfo["func"] not in ONCE_FUNCS) or linfo.get("is_lambda"):
+                            record_line_or_span(rel, ln)
                             idxs = fd_map.get(f"{rel}:{ln}:{col}:{kind}")
                             if idxs:
                                 selected.update(remap_idxs(idxs))
@@ -1712,11 +1831,15 @@ def main() -> None:
                                 dk_map = get_dict_keys()
                             sub_cls_list = cls_sub_qualnames.get(cls_name, (cls_name,))
                             for sub_c in sub_cls_list:
-                                full_idxs = dk_map.get(f"{sub_c}|{attr_name}|__FULL__")
+                                fk = f"{sub_c}|{attr_name}|__FULL__"
+                                touch_info["touched_dicts"].add(fk)
+                                full_idxs = dk_map.get(fk)
                                 if full_idxs:
                                     selected.update(remap_idxs(full_idxs))
                                 for kt in changed_keys:
-                                    k_idxs = dk_map.get(f"{sub_c}|{attr_name}|{kt}")
+                                    dk = f"{sub_c}|{attr_name}|{kt}"
+                                    touch_info["touched_dicts"].add(dk)
+                                    k_idxs = dk_map.get(dk)
                                     if k_idxs:
                                         selected.update(remap_idxs(k_idxs))
                             for loc in test_dict_readers.get(attr_name, ()):
@@ -1725,9 +1848,170 @@ def main() -> None:
                         else:
                             other_spans.append((d_ln, d_end_ln))
 
-                if not other_spans:
+                if not other_spans and not extra_anchors:
                     continue
 
+            def process_sqlglot_line(ln: int, allow_neighbor_delta: bool) -> None:
+                if ln < 1:
+                    return
+                info = get_line_info(rel, ln)
+                if info.get("is_lambda"):
+                    lr = info["lambda_range"]
+                    for l2 in range(lr[0], lr[1] + 1):
+                        record_line_or_span(rel, l2)
+                        selected.update(tests_for_line_or_span(rel, l2))
+                elif info.get("func"):
+                    if info["func"] in ONCE_FUNCS:
+                        touch_info["subtest_eligible"] = False
+                        selected.update(file_importers.get(rel, all_test_nums))
+                        return
+                    record_line_or_span(rel, ln)
+                    cov_here = tests_for_line_or_span(rel, ln)
+                    if cov_here:
+                        selected.update(cov_here)
+                    else:
+                        fr = info["func_range"]
+                        sig_end = info.get("sig_end", fr[0] + 1)
+                        if ln <= sig_end:
+                            for l2 in range(fr[0], fr[1] + 1):
+                                touch_info["touched_lines"].add((rel, l2))
+                                selected.update(get_line_tests(rel, l2))
+                        elif allow_neighbor_delta:
+                            for delta in (-1, 1, -2, 2):
+                                record_line_or_span(rel, ln + delta)
+                                selected.update(tests_for_line_or_span(rel, ln + delta))
+                elif "class_attr" in info:
+                    attr_readers, name_readers = get_readers()
+                    cls_name, attr_name = info["class_attr"]
+                    is_expr_class_attr = rel.startswith("sqlglot/expressions/") and attr_name in GENERIC_EXPR_ATTRS
+                    reader_locs: list[str] = []
+                    if attr_name and not is_expr_class_attr:
+                        reader_locs.extend(attr_readers.get(attr_name, ()))
+                    if cls_name:
+                        short_cls = cls_name.split(".")[-1]
+                        reader_locs.extend(name_readers.get(cls_name, ()))
+                        reader_locs.extend(attr_readers.get(cls_name, ()))
+                        if short_cls != cls_name:
+                            reader_locs.extend(name_readers.get(short_cls, ()))
+                            reader_locs.extend(attr_readers.get(short_cls, ()))
+
+                    importers_of_rel = mod_importers.get(rel, {rel})
+                    cls_kind, d_names = classify_class(cls_name) if cls_name else (None, None)
+
+                    def tests_for_reader_loc(r_rel: str, r_ln: int) -> set[int]:
+                        direct = get_line_tests(r_rel, r_ln)
+                        return direct if direct else tests_for_line_or_span(r_rel, r_ln)
+
+                    if d_names is not None:
+                        if reader_locs:
+                            sqlglot_matched = set()
+                            has_sqlglot_reader = False
+                            sqlglot_reader_pairs: list[tuple[str, int]] = []
+                            test_matched = set()
+                            for loc in reader_locs:
+                                r_rel, r_ln_str = loc.rsplit(":", 1)
+                                r_ln = int(r_ln_str)
+                                if r_rel.startswith("tests/"):
+                                    test_matched.update(tests_for_test_line(r_rel, r_ln))
+                                else:
+                                    has_sqlglot_reader = True
+                                    sqlglot_reader_pairs.append((r_rel, r_ln))
+                                    t_here = tests_for_reader_loc(r_rel, r_ln)
+                                    if t_here:
+                                        sqlglot_matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
+                            if attr_name == "TRANSFORMS":
+                                touch_info["subtest_eligible"] = False
+                                sqlglot_matched.update(component_tests_for_reader(d_names, "sqlglot/generator.py", 1030))
+                            if has_sqlglot_reader and attr_name in scalar_attrs:
+                                sa_map = get_scalar_attr_map()
+                                sc_tests = set()
+                                sc_keys = set(d_names)
+                                if cls_name:
+                                    sc_keys.update(cls_sub_qualnames.get(cls_name, (cls_name,)))
+                                for k in sc_keys:
+                                    ak = f"{k}|{attr_name}"
+                                    t = sa_map.get(ak)
+                                    if t:
+                                        sc_tests.update(remap_idxs(t))
+                                if sc_tests:
+                                    for k in sc_keys:
+                                        touch_info["touched_attrs"].add(f"{k}|{attr_name}")
+                                    selected.update(sc_tests)
+                                else:
+                                    for r_rel, r_ln in sqlglot_reader_pairs:
+                                        record_line_or_span(r_rel, r_ln)
+                                    selected.update(sqlglot_matched)
+                            else:
+                                for r_rel, r_ln in sqlglot_reader_pairs:
+                                    record_line_or_span(r_rel, r_ln)
+                                selected.update(sqlglot_matched)
+                            selected.update(test_matched)
+                        else:
+                            touch_info["subtest_eligible"] = False
+                            selected.update(union_dialect_tests(d_names))
+                        if attr_name:
+                            for mrel in mod_attr_readers.get(attr_name, ()):
+                                if mrel in importers_of_rel:
+                                    touch_info["subtest_eligible"] = False
+                                    selected.update(file_importers.get(mrel, ()))
+                    elif reader_locs:
+                        for loc in reader_locs:
+                            r_rel, r_ln_str = loc.rsplit(":", 1)
+                            r_ln = int(r_ln_str)
+                            if r_rel.startswith("tests/"):
+                                selected.update(tests_for_test_line(r_rel, r_ln))
+                            else:
+                                record_line_or_span(r_rel, r_ln)
+                                selected.update(tests_for_reader_loc(r_rel, r_ln))
+                        if attr_name:
+                            mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
+                            if is_expr_class_attr and cls_name:
+                                mod_cls_set = set(mod_attr_readers.get(cls_name, ())) | set(mod_name_readers.get(cls_name, ()))
+                                mod_matches = mod_attr_set & mod_cls_set & importers_of_rel
+                            else:
+                                mod_matches = mod_attr_set & importers_of_rel
+                            for mrel in mod_matches:
+                                touch_info["subtest_eligible"] = False
+                                selected.update(file_importers.get(mrel, ()))
+                    elif not is_expr_class_attr:
+                        touch_info["subtest_eligible"] = False
+                        selected.update(get_file_cov(rel))
+                elif "module_var" in info:
+                    touch_info["subtest_eligible"] = False
+                    attr_readers, name_readers = get_readers()
+                    var_name = info["module_var"]
+                    importers_of_rel = mod_importers.get(rel, {rel})
+                    reader_locs = []
+                    if var_name:
+                        for loc in name_readers.get(var_name, ()):
+                            r_rel, _ = loc.rsplit(":", 1)
+                            if r_rel in importers_of_rel:
+                                reader_locs.append(loc)
+                        for loc in attr_readers.get(var_name, ()):
+                            r_rel, _ = loc.rsplit(":", 1)
+                            if r_rel in importers_of_rel:
+                                reader_locs.append(loc)
+                        for mrel in mod_name_readers.get(var_name, ()):
+                            if mrel in importers_of_rel:
+                                selected.update(file_importers.get(mrel, ()))
+                        for mrel in mod_attr_readers.get(var_name, ()):
+                            if mrel in importers_of_rel:
+                                selected.update(file_importers.get(mrel, ()))
+                    if reader_locs:
+                        for loc in reader_locs:
+                            r_rel, r_ln_str = loc.rsplit(":", 1)
+                            r_ln = int(r_ln_str)
+                            if r_rel.startswith("tests/"):
+                                selected.update(tests_for_test_line(r_rel, r_ln))
+                            else:
+                                selected.update(tests_for_line_or_span(r_rel, r_ln))
+                    elif not (var_name and (mod_name_readers.get(var_name) or mod_attr_readers.get(var_name))):
+                        selected.update(get_file_cov(rel))
+                else:
+                    touch_info["subtest_eligible"] = False
+                    selected.update(get_file_cov(rel))
+
+            seen_lines: set[int] = set()
             for h in fdiff["hunks"]:
                 old_ln = h["old_start"]
                 touched_old_lines: list[int] = []
@@ -1754,147 +2038,96 @@ def main() -> None:
                     ]
 
                 candidate_lines = touched_old_lines if touched_old_lines else insertion_anchors
+                allow_delta = not touched_old_lines
                 for ln in candidate_lines:
-                    if ln < 1:
-                        continue
-                    info = get_line_info(rel, ln)
-                    if info.get("is_lambda"):
-                        lr = info["lambda_range"]
-                        for l2 in range(lr[0], lr[1] + 1):
-                            selected.update(tests_for_line_or_span(rel, l2))
-                    elif info.get("func"):
-                        if info["func"] in ONCE_FUNCS:
-                            selected.update(file_importers.get(rel, all_test_nums))
-                            continue
-                        cov_here = tests_for_line_or_span(rel, ln)
-                        if cov_here:
-                            selected.update(cov_here)
-                        else:
-                            fr = info["func_range"]
-                            sig_end = info.get("sig_end", fr[0] + 1)
-                            if ln <= sig_end:
-                                for l2 in range(fr[0], fr[1] + 1):
-                                    selected.update(get_line_tests(rel, l2))
-                            elif not touched_old_lines:
-                                for delta in (-1, 1, -2, 2):
-                                    selected.update(tests_for_line_or_span(rel, ln + delta))
-                    elif "class_attr" in info:
-                        attr_readers, name_readers = get_readers()
-                        cls_name, attr_name = info["class_attr"]
-                        is_expr_class_attr = rel.startswith("sqlglot/expressions/") and attr_name in GENERIC_EXPR_ATTRS
-                        reader_locs: list[str] = []
-                        if attr_name and not is_expr_class_attr:
-                            reader_locs.extend(attr_readers.get(attr_name, ()))
-                        if cls_name:
-                            short_cls = cls_name.split(".")[-1]
-                            reader_locs.extend(name_readers.get(cls_name, ()))
-                            reader_locs.extend(attr_readers.get(cls_name, ()))
-                            if short_cls != cls_name:
-                                reader_locs.extend(name_readers.get(short_cls, ()))
-                                reader_locs.extend(attr_readers.get(short_cls, ()))
+                    if ln not in seen_lines:
+                        seen_lines.add(ln)
+                        process_sqlglot_line(ln, allow_delta)
 
-                        importers_of_rel = mod_importers.get(rel, {rel})
-                        cls_kind, d_names = classify_class(cls_name) if cls_name else (None, None)
+            if use_ast_diff and not mismatch and extra_anchors:
+                for ln in extra_anchors:
+                    if ln not in seen_lines:
+                        seen_lines.add(ln)
+                        process_sqlglot_line(ln, True)
 
-                        def tests_for_reader_loc(r_rel: str, r_ln: int) -> set[int]:
-                            direct = get_line_tests(r_rel, r_ln)
-                            return direct if direct else tests_for_line_or_span(r_rel, r_ln)
+        return selected, touch_info
 
-                        if d_names is not None:
-                            if reader_locs:
-                                sqlglot_matched = set()
-                                has_sqlglot_reader = False
-                                test_matched = set()
-                                for loc in reader_locs:
-                                    r_rel, r_ln_str = loc.rsplit(":", 1)
-                                    r_ln = int(r_ln_str)
-                                    if r_rel.startswith("tests/"):
-                                        test_matched.update(tests_for_test_line(r_rel, r_ln))
-                                    else:
-                                        has_sqlglot_reader = True
-                                        t_here = tests_for_reader_loc(r_rel, r_ln)
-                                        if t_here:
-                                            sqlglot_matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
-                                if attr_name == "TRANSFORMS":
-                                    sqlglot_matched.update(component_tests_for_reader(d_names, "sqlglot/generator.py", 1030))
-                                if has_sqlglot_reader and attr_name in scalar_attrs:
-                                    sa_map = get_scalar_attr_map()
-                                    sc_tests = set()
-                                    sc_keys = set(d_names)
-                                    if cls_name:
-                                        sc_keys.update(cls_sub_qualnames.get(cls_name, (cls_name,)))
-                                    for k in sc_keys:
-                                        t = sa_map.get(f"{k}|{attr_name}")
-                                        if t:
-                                            sc_tests.update(remap_idxs(t))
-                                    selected.update(sc_tests if sc_tests else sqlglot_matched)
-                                else:
-                                    selected.update(sqlglot_matched)
-                                selected.update(test_matched)
-                            else:
-                                selected.update(union_dialect_tests(d_names))
-                            if attr_name:
-                                for mrel in mod_attr_readers.get(attr_name, ()):
-                                    if mrel in importers_of_rel:
-                                        selected.update(file_importers.get(mrel, ()))
-                        elif reader_locs:
-                            for loc in reader_locs:
-                                r_rel, r_ln_str = loc.rsplit(":", 1)
-                                r_ln = int(r_ln_str)
-                                if r_rel.startswith("tests/"):
-                                    selected.update(tests_for_test_line(r_rel, r_ln))
-                                else:
-                                    selected.update(tests_for_reader_loc(r_rel, r_ln))
-                            if attr_name:
-                                mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
-                                if is_expr_class_attr and cls_name:
-                                    mod_cls_set = set(mod_attr_readers.get(cls_name, ())) | set(mod_name_readers.get(cls_name, ()))
-                                    mod_matches = mod_attr_set & mod_cls_set & importers_of_rel
-                                else:
-                                    mod_matches = mod_attr_set & importers_of_rel
-                                for mrel in mod_matches:
-                                    selected.update(file_importers.get(mrel, ()))
-                        elif not is_expr_class_attr:
-                            selected.update(get_file_cov(rel))
-                    elif "module_var" in info:
-                        attr_readers, name_readers = get_readers()
-                        var_name = info["module_var"]
-                        importers_of_rel = mod_importers.get(rel, {rel})
-                        reader_locs = []
-                        if var_name:
-                            for loc in name_readers.get(var_name, ()):
-                                r_rel, _ = loc.rsplit(":", 1)
-                                if r_rel in importers_of_rel:
-                                    reader_locs.append(loc)
-                            for loc in attr_readers.get(var_name, ()):
-                                r_rel, _ = loc.rsplit(":", 1)
-                                if r_rel in importers_of_rel:
-                                    reader_locs.append(loc)
-                            for mrel in mod_name_readers.get(var_name, ()):
-                                if mrel in importers_of_rel:
-                                    selected.update(file_importers.get(mrel, ()))
-                            for mrel in mod_attr_readers.get(var_name, ()):
-                                if mrel in importers_of_rel:
-                                    selected.update(file_importers.get(mrel, ()))
-                        if reader_locs:
-                            for loc in reader_locs:
-                                r_rel, r_ln_str = loc.rsplit(":", 1)
-                                r_ln = int(r_ln_str)
-                                if r_rel.startswith("tests/"):
-                                    selected.update(tests_for_test_line(r_rel, r_ln))
-                                else:
-                                    selected.update(tests_for_line_or_span(r_rel, r_ln))
-                        elif not (var_name and (mod_name_readers.get(var_name) or mod_attr_readers.get(var_name))):
-                            selected.update(get_file_cov(rel))
-                    else:
-                        selected.update(get_file_cov(rel))
-
-        return selected
-
+    # Pass 1: Static selection for all commits
+    entries: list[list] = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        sel = select_for_patch(patch.read_text("utf-8"))
+        patch_text = patch.read_text("utf-8")
+        sel, touch_info = select_for_patch(patch_text)
+        entries.append([patch.stem, sel, patch_text, touch_info])
+
+    # Pass 2: Twin-Zygote isolated dynamic verification (Linux os.fork)
+    if hasattr(os, "fork") and os.environ.get("BLAST_NO_VERIFY") != "1":
+        import verifier
+
+        def pack_cost_fn(s: set[int]) -> int:
+            return pack_cost(s, dur_ms)
+
+        subtest_map = get_subtest_map()
+        max_verify_cpu_s = float(os.environ.get("BLAST_VERIFY_BUDGET", "45.0"))
+        wall_deadline = time.monotonic() + float(os.environ.get("BLAST_VERIFY_WALL", "120.0"))
+
+        clean_jobs: list[tuple[int, list, dict, list, list]] = []
+        warm_jobs: list[tuple[int, list, dict, list, list]] = []
+
+        for entry in entries:
+            _, sel, patch_text, touch_info = entry
+            if not sel:
+                continue
+            sub_plan = verifier.compute_subtest_plan(sel, touch_info, subtest_map, num_to_id, dur_ms, pack_cost_fn)
+            allow_zf = verifier.should_zero_fail_prove(sel, num_to_id, dur_ms, pack_cost_fn)
+            if not sub_plan and not allow_zf:
+                continue
+            overlay, ok = verifier.build_patch_overlay(patch_text, REF, parse_patch, apply_hunks)
+            if not ok or not overlay:
+                continue
+            all_cands = [(num, num_to_id[num], dur_ms[num]) for num in sel if num in num_to_id]
+            priority = pack_cost_fn(sel) if sub_plan else 2000
+            job = (priority, entry, overlay, sub_plan, all_cands)
+            if verifier.needs_clean_fork(overlay):
+                clean_jobs.append(job)
+            else:
+                warm_jobs.append(job)
+
+        clean_jobs.sort(key=lambda x: -x[0])
+        warm_jobs.sort(key=lambda x: -x[0])
+
+        # Group A: Clean-fork BEFORE `import sqlglot`
+        for _, entry, overlay, sub_plan, all_cands in clean_jobs:
+            if verifier.get_children_cpu_seconds() >= max_verify_cpu_s or time.monotonic() >= wall_deadline:
+                break
+            passed, _ = verifier.verify_commit_fork(
+                REF, overlay, sub_plan, all_cands, True, pack_cost_fn, dur_ms, num_to_id
+            )
+            if passed:
+                entry[1].difference_update(passed)
+
+        # Group B: Warm-fork AFTER single `import sqlglot` in parent (~2-5ms per fork)
+        if warm_jobs and verifier.get_children_cpu_seconds() < max_verify_cpu_s and time.monotonic() < wall_deadline:
+            ref_str = str(REF)
+            if ref_str not in sys.path:
+                sys.path.insert(0, ref_str)
+            try:
+                with contextlib.redirect_stdout(sys.stderr):
+                    import sqlglot  # noqa: F401
+            except BaseException:
+                pass
+            for _, entry, overlay, sub_plan, all_cands in warm_jobs:
+                if verifier.get_children_cpu_seconds() >= max_verify_cpu_s or time.monotonic() >= wall_deadline:
+                    break
+                passed, _ = verifier.verify_commit_fork(
+                    REF, overlay, sub_plan, all_cands, True, pack_cost_fn, dur_ms, num_to_id
+                )
+                if passed:
+                    entry[1].difference_update(passed)
+
+    # Pass 3: Deterministic sorted JSONL output
+    for stem, sel, _, _ in entries:
         workers = pack_workers(sel, dur_ms)
-        sys.stdout.write(json.dumps({"commit": patch.stem, "workers": workers}) + "\n")
+        sys.stdout.write(json.dumps({"commit": stem, "workers": workers}) + "\n")
     sys.stdout.flush()
 
 

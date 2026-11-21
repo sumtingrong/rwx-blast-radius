@@ -683,11 +683,20 @@ def _trace_worker(args):
     in_setup = False
     in_probe = 0
 
+    sub_active = False
+    sub_bit = 1
+    cur_sub_total = 0
+    cur_sub_lines: dict[tuple[str, int], int] = defaultdict(int)
+    cur_sub_dicts: dict[tuple[str, str, str], int] = defaultdict(int)
+    cur_sub_attrs: dict[tuple[str, str], int] = defaultdict(int)
+
     def rec_dict(tag: tuple[str, str], ktag: str):
         if in_probe:
             return
         if active_test or (active_cmp and not in_setup):
             cur_dict_hits.add((tag[0], tag[1], ktag))
+            if sub_active:
+                cur_sub_dicts[(tag[0], tag[1], ktag)] |= sub_bit
         elif in_setup:
             cls_dict_hits.add((tag[0], tag[1], ktag))
 
@@ -903,28 +912,47 @@ def _trace_worker(args):
             in_probe += 1
             try:
                 dst = cls_attr_hits if in_setup else cur_attr_hits
+                rec_sub = sub_active and not in_setup
                 if isinstance(obj, type):
-                    dst.add((obj.__qualname__, name))
+                    k1 = (obj.__qualname__, name)
+                    dst.add(k1)
+                    if rec_sub:
+                        cur_sub_attrs[k1] |= sub_bit
                     if obj.__module__.startswith("tests."):
                         b = _first_sqlglot_base(obj)
                         if b is not None:
-                            dst.add((b.__qualname__, name))
+                            k2 = (b.__qualname__, name)
+                            dst.add(k2)
+                            if rec_sub:
+                                cur_sub_attrs[k2] |= sub_bit
                 else:
                     d = getattr(obj, "dialect", None)
                     if d is not None:
                         dt = type(d)
-                        dst.add((dt.__name__, name))
+                        k1 = (dt.__name__, name)
+                        dst.add(k1)
+                        if rec_sub:
+                            cur_sub_attrs[k1] |= sub_bit
                         if dt.__module__.startswith("tests."):
                             b = _first_sqlglot_base(dt)
                             if b is not None:
-                                dst.add((b.__name__, name))
+                                k2 = (b.__name__, name)
+                                dst.add(k2)
+                                if rec_sub:
+                                    cur_sub_attrs[k2] |= sub_bit
                     else:
                         ot = type(obj)
-                        dst.add((ot.__qualname__, name))
+                        k1 = (ot.__qualname__, name)
+                        dst.add(k1)
+                        if rec_sub:
+                            cur_sub_attrs[k1] |= sub_bit
                         if ot.__module__.startswith("tests."):
                             b = _first_sqlglot_base(ot)
                             if b is not None:
-                                dst.add((b.__qualname__, name))
+                                k2 = (b.__qualname__, name)
+                                dst.add(k2)
+                                if rec_sub:
+                                    cur_sub_attrs[k2] |= sub_bit
             finally:
                 in_probe -= 1
         return val
@@ -1190,6 +1218,7 @@ def _trace_worker(args):
             return None
         return rel
 
+    cls_setup_lines: set[tuple[str, int]] = set()
     use_monitoring = hasattr(sys, "monitoring")
     if use_monitoring:
         mon = sys.monitoring
@@ -1207,6 +1236,12 @@ def _trace_worker(args):
                 rel = get_rel_for_code(code)
                 if rel is not None:
                     current_lines.add((rel, lineno))
+                    if sub_active:
+                        cur_sub_lines[(rel, lineno)] |= sub_bit
+            elif in_setup:
+                rel = get_rel_for_code(code)
+                if rel is not None:
+                    cls_setup_lines.add((rel, lineno))
             return mon.DISABLE
 
         mon.register_callback(TOOL_ID, mon.events.PY_START, on_py_start)
@@ -1217,22 +1252,63 @@ def _trace_worker(args):
 
         def trace_lines(frame, event, arg):
             nonlocal trace_hits
-            if event == "line" and active_test:
+            if event == "line" and (active_test or in_setup):
                 trace_hits += 1
                 if (trace_hits & 4095) == 0 and time.monotonic() > trace_deadline:
                     sys.settrace(None)
                     return None
                 rel = get_rel_for_code(frame.f_code)
                 if rel is not None:
-                    current_lines.add((rel, frame.f_lineno))
+                    if active_test:
+                        current_lines.add((rel, frame.f_lineno))
+                        if sub_active:
+                            cur_sub_lines[(rel, frame.f_lineno)] |= sub_bit
+                    else:
+                        cls_setup_lines.add((rel, frame.f_lineno))
             return trace_lines
 
         def trace_fn(frame, event, arg):
-            if event == "call" and active_test:
+            if event == "call" and (active_test or in_setup):
                 rel = get_rel_for_code(frame.f_code)
                 if rel is not None:
                     return trace_lines
             return None
+
+    def set_sub_idx(idx: int | None):
+        nonlocal sub_bit, cur_sub_total
+        if idx is None:
+            sub_bit = 1
+        else:
+            sub_bit = 1 << (idx + 1)
+            if idx + 1 > cur_sub_total:
+                cur_sub_total = idx + 1
+        if use_monitoring:
+            sys.monitoring.restart_events()
+
+    class _SubIter:
+        def __init__(self, items):
+            self._items = list(items)
+        def __len__(self):
+            return len(self._items)
+        def __iter__(self):
+            for idx, item in enumerate(self._items):
+                set_sub_idx(idx)
+                yield item
+            set_sub_idx(None)
+
+    _SUBTEST_TRACKED = {
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds": "mp_exec",
+        "tests/test_executor.py::TestExecutor::test_execute_tpch": "mp_exec",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch": "opt_tpch",
+        "tests/test_generator.py::TestGenerator::test_generator_memory": "gen_mem",
+        "tests/test_optimizer.py::TestOptimizer::test_tpcds": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs": "fixture_pairs",
+        "tests/test_optimizer.py::TestOptimizer::test_qualify_columns": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_canonicalize": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_simplify": "check_file",
+        "tests/test_optimizer.py::TestOptimizer::test_optimize": "check_file",
+    }
 
     import time
     results = []
@@ -1260,15 +1336,25 @@ def _trace_worker(args):
             cls_falsy.clear()
             cls_dict_hits.clear()
             cls_attr_hits.clear()
+            cls_setup_lines.clear()
             in_probe = 0
             active_test = False
             in_setup = True
             active_cmp = True
             if hasattr(cls, "setUpClass"):
+                trace_hits = 0
+                trace_deadline = time.monotonic() + 120.0
+                if use_monitoring:
+                    sys.monitoring.restart_events()
+                else:
+                    sys.settrace(trace_fn)
                 try:
                     cls.setUpClass()
                 except Exception:
                     pass
+                finally:
+                    if not use_monitoring:
+                        sys.settrace(None)
             in_setup = False
             active_cmp = False
             in_probe = 0
@@ -1282,6 +1368,7 @@ def _trace_worker(args):
             saved_falsy = set(cls_falsy)
             saved_dict_hits = set(cls_dict_hits)
             saved_attr_hits = set(cls_attr_hits)
+            saved_setup_lines = set(cls_setup_lines)
 
             for meth_name in meths:
                 nodeid = f"{file_path}::{cls_name}::{meth_name}"
@@ -1296,7 +1383,98 @@ def _trace_worker(args):
                 cur_falsy.clear()
                 cur_dict_hits.clear()
                 cur_attr_hits.clear()
+                sub_kind = _SUBTEST_TRACKED.get(nodeid)
+                sub_active = sub_kind is not None
+                sub_bit = 1
+                cur_sub_total = 0
+                if sub_active:
+                    cur_sub_lines.clear()
+                    cur_sub_dicts.clear()
+                    cur_sub_attrs.clear()
                 inst = cls(meth_name)
+                restorers = []
+                if sub_kind == "mp_exec":
+                    orig_mpe = cls._mp_execute
+                    def _tracked_mpe(self_inst, schema, tables, sqls, tpch):
+                        mod.initializer(schema, tables)
+                        for idx_q, (q_args, q_sql, _) in enumerate(sqls):
+                            set_sub_idx(idx_q)
+                            try:
+                                table = mod.mp_execute(mod.parse_one(q_sql), q_args)
+                                if table is not None:
+                                    self_inst.subtestHelper(idx_q, table, tpch=tpch)
+                            except Exception:
+                                pass
+                        set_sub_idx(None)
+                    cls._mp_execute = _tracked_mpe
+                    restorers.append(lambda: setattr(cls, "_mp_execute", orig_mpe))
+                elif sub_kind == "opt_tpch":
+                    inst.tpch_sqls = _SubIter(cls.tpch_sqls)
+                elif sub_kind == "gen_mem":
+                    orig_dialects = mod.Dialects
+                    mod.Dialects = _SubIter(list(orig_dialects))
+                    inst.assertLess = lambda *a, **kw: None
+                    restorers.append(lambda: setattr(mod, "Dialects", orig_dialects))
+                elif sub_kind == "check_file":
+                    orig_cf = cls.check_file
+                    cf_counter = [0]
+                    def _tracked_cf(self_inst, file, func, pretty=False, execute=None, only=None, **kwargs):
+                        pairs = list(mod.load_sql_fixture_pairs(f"optimizer/{file}.sql"))
+                        for i_local, (meta, sql, expected) in enumerate(pairs):
+                            idx_p = cf_counter[0]
+                            cf_counter[0] += 1
+                            set_sub_idx(idx_p)
+                            title = meta.get("title") or f"{i_local + 1}, {sql}"
+                            if only and title != only:
+                                continue
+                            dialect = meta.get("dialect")
+                            leave_tables_isolated = meta.get("leave_tables_isolated")
+                            validate_qualify_columns = meta.get("validate_qualify_columns")
+                            canonicalize_table_aliases = meta.get("canonicalize_table_aliases")
+                            func_kwargs = kwargs.copy()
+                            if schema := meta.get("schema"):
+                                func_kwargs["schema"] = json.loads(schema)
+                            if leave_tables_isolated is not None:
+                                func_kwargs["leave_tables_isolated"] = mod.string_to_bool(leave_tables_isolated)
+                            if validate_qualify_columns is not None:
+                                func_kwargs["validate_qualify_columns"] = mod.string_to_bool(validate_qualify_columns)
+                            if dialect:
+                                func_kwargs["dialect"] = dialect
+                            if canonicalize_table_aliases is not None:
+                                func_kwargs["canonicalize_table_aliases"] = mod.string_to_bool(canonicalize_table_aliases)
+                            fixture_execute = False if execute is False else meta.get("execute", execute)
+                            if min_python := meta.get("execute_min_python"):
+                                fixture_execute = mod.string_to_bool(fixture_execute) and sys.version_info >= tuple(map(int, min_python.split(".")))
+                            try:
+                                fut = self_inst.pool.submit(mod.parse_and_optimize, func, sql, dialect, **func_kwargs)
+                                optimized = fut.result()
+                                actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                self_inst.assertEqual(expected, actual)
+                                if mod.string_to_bool(fixture_execute):
+                                    dfs = []
+                                    for expression in (mod.parse_one(sql, read=dialect), optimized):
+                                        if not isinstance(expression, (mod.exp.Query, mod.exp.Values)):
+                                            expression = mod.exp.select(mod.exp.alias_(expression, "_col_0"))
+                                        dfs.append(self_inst.conn.execute(expression.sql(dialect="duckdb")).df())
+                                    mod.assert_frame_equal(*dfs)
+                            except Exception:
+                                pass
+                        set_sub_idx(None)
+                    cls.check_file = _tracked_cf
+                    restorers.append(lambda: setattr(cls, "check_file", orig_cf))
+                elif sub_kind == "fixture_pairs":
+                    orig_lfp = mod.load_sql_fixture_pairs
+                    lfp_counter = [0]
+                    def _tracked_lfp(*a, **kw):
+                        for item in orig_lfp(*a, **kw):
+                            idx_p = lfp_counter[0]
+                            lfp_counter[0] += 1
+                            set_sub_idx(idx_p)
+                            yield item
+                        set_sub_idx(None)
+                    mod.load_sql_fixture_pairs = _tracked_lfp
+                    restorers.append(lambda: setattr(mod, "load_sql_fixture_pairs", orig_lfp))
+
                 in_probe = 0
                 active_test = True
                 active_cmp = True
@@ -1307,21 +1485,48 @@ def _trace_worker(args):
                 else:
                     sys.settrace(trace_fn)
                 try:
-                    inst.setUp()
-                    getattr(inst, meth_name)()
-                    inst.tearDown()
+                    if sub_kind in ("opt_tpch", "fixture_pairs"):
+                        inst.run(unittest.TestResult())
+                    else:
+                        inst.setUp()
+                        getattr(inst, meth_name)()
+                        inst.tearDown()
                 except Exception:
                     pass
                 finally:
                     active_test = False
+                    sub_active = False
                     if not use_monitoring:
                         sys.settrace(None)
+                    for rfn in restorers:
+                        try:
+                            rfn()
+                        except Exception:
+                            pass
                     try:
                         inst.doCleanups()
                     except Exception:
                         pass
                     active_cmp = False
                     in_probe = 0
+                sub_rec = None
+                if sub_kind is not None and cur_sub_total > 0:
+                    for sl in saved_setup_lines:
+                        cur_sub_lines[sl] |= 1
+                    for dh in saved_dict_hits:
+                        cur_sub_dicts[dh] |= 1
+                    for ah in saved_attr_hits:
+                        cur_sub_attrs[ah] |= 1
+                    sub_lines_by_rel: dict[str, dict[int, int]] = defaultdict(dict)
+                    for (r, ln), mask in cur_sub_lines.items():
+                        sub_lines_by_rel[r][ln] = mask
+                    sub_rec = (
+                        sub_kind,
+                        cur_sub_total,
+                        dict(sub_lines_by_rel),
+                        {f"{c}|{a}|{k}": mask for (c, a, k), mask in cur_sub_dicts.items()},
+                        {f"{d}|{a}": mask for (d, a), mask in cur_sub_attrs.items()},
+                    )
                 all_fx = set(current_fixtures)
                 for fx in saved_class_fixtures:
                     if cls_name == "TestExecutor":
@@ -1343,6 +1548,7 @@ def _trace_worker(args):
                     [f"{c}|{a}|{k}" for (c, a, k) in (cur_dict_hits | saved_dict_hits)],
                     [f"{d}|{a}" for (d, a) in (cur_attr_hits | saved_attr_hits)],
                     [f"{r}:{ln}:{col}:{op}" for (r, ln, col, op) in (sites[s] for s in (cur_falsy | saved_falsy))],
+                    sub_rec,
                 ))
 
             if hasattr(cls, "tearDownClass"):
@@ -1414,11 +1620,21 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
     falsy_diff_to_idxs = defaultdict(set)
     dict_key_to_idxs = defaultdict(set)
     scalar_attr_to_idxs = defaultdict(set)
+    subtest_map: dict[str, dict] = {}
 
     for wout in worker_outputs:
-        for nodeid, lines, fxs, dls, toks, parses, ginits, gsqls, cmp_bads, dict_hits, attr_hits, falsy_bads in wout:
+        for nodeid, lines, fxs, dls, toks, parses, ginits, gsqls, cmp_bads, dict_hits, attr_hits, falsy_bads, sub_rec in wout:
             idx = len(nodeids)
             nodeids.append(nodeid)
+            if sub_rec is not None:
+                s_kind, s_tot, s_lines, s_dicts, s_attrs = sub_rec
+                subtest_map[nodeid] = {
+                    "kind": s_kind,
+                    "total": s_tot,
+                    "lines": s_lines,
+                    "dicts": s_dicts,
+                    "attrs": s_attrs,
+                }
             for loc in lines:
                 line_to_idxs[loc].add(idx)
             for fx in fxs:
@@ -1693,6 +1909,9 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         with open(out_path.parent / "scalar_attrs.pkl", "wb") as sa:
             pickle.dump(dict(scalar_attr_to_idxs), sa, protocol=pickle.HIGHEST_PROTOCOL)
 
+        with open(out_path.parent / "subtest_map.pkl", "wb") as sm:
+            pickle.dump(subtest_map, sm, protocol=pickle.HIGHEST_PROTOCOL)
+
         index_payload = {
             "split": True,
             "nodeids": nodeids,
@@ -1726,10 +1945,11 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
             + (out_path.parent / "falsy_diffs.pkl").stat().st_size
             + (out_path.parent / "cmp_diffs.pkl").stat().st_size
             + (out_path.parent / "scalar_attrs.pkl").stat().st_size
+            + (out_path.parent / "subtest_map.pkl").stat().st_size
             + sum(p.stat().st_size for p in meta_dir.iterdir())
         ) / 1e6
         print(
-            f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB, cmp_diffs={len(cmp_diff_to_idxs)}, falsy_diffs={len(falsy_diff_to_idxs)}, dict_keys={len(dict_key_to_idxs)}, scalar_attrs={len(scalar_attr_to_idxs)}) for {len(nodeids)} tests",
+            f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB, cmp_diffs={len(cmp_diff_to_idxs)}, falsy_diffs={len(falsy_diff_to_idxs)}, dict_keys={len(dict_key_to_idxs)}, scalar_attrs={len(scalar_attr_to_idxs)}, subtests={len(subtest_map)}) for {len(nodeids)} tests",
             flush=True,
         )
         return

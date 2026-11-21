@@ -16,10 +16,13 @@ COPY build_maps.py /build/build_maps.py
 RUN mkdir -p /build/out && python /build/build_maps.py /build/sqlglot_ref /build/out/maps.pkl
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /build/out /app/
 COPY --from=builder /build/sqlglot_ref/sqlglot /app/sqlglot_ref/sqlglot
 COPY --from=builder /build/sqlglot_ref/tests /app/sqlglot_ref/tests
 COPY selector.py /app/selector.py
+COPY verifier.py /app/verifier.py
 RUN chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]

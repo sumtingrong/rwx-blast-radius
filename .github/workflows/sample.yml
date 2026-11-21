@@ -1,0 +1,13 @@
+name: Verify Blast Radius Sample
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run make sample
+        run: make sample

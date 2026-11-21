@@ -22,6 +22,14 @@ from concurrent.futures import Future
 from pathlib import Path
 
 
+def _yield_bool_leaves(expr: ast.AST):
+    if isinstance(expr, ast.BoolOp):
+        for v in expr.values:
+            yield from _yield_bool_leaves(v)
+    else:
+        yield (expr.lineno, expr.end_lineno or expr.lineno, expr)
+
+
 def iter_stmt_spans(node: ast.AST):
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -29,12 +37,15 @@ def iter_stmt_spans(node: ast.AST):
             yield (child.lineno, max(child.lineno, body_start - 1), child)
             yield from iter_stmt_spans(child)
         elif isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
-            if isinstance(child, ast.If):
-                yield (child.lineno, child.test.end_lineno or child.lineno, child)
+            if isinstance(child, (ast.If, ast.While)):
+                if isinstance(child.test, ast.BoolOp):
+                    first_leaf = next(_yield_bool_leaves(child.test))
+                    yield (child.lineno, max(child.lineno, first_leaf[1]), child)
+                    yield from _yield_bool_leaves(child.test)
+                else:
+                    yield (child.lineno, child.test.end_lineno or child.lineno, child)
             elif isinstance(child, (ast.For, ast.AsyncFor)):
                 yield (child.lineno, child.iter.end_lineno or child.lineno, child)
-            elif isinstance(child, ast.While):
-                yield (child.lineno, child.test.end_lineno or child.lineno, child)
             else:
                 yield (child.lineno, child.lineno, child)
             yield from iter_stmt_spans(child)
@@ -768,6 +779,71 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
                     st.append(dep)
         file_dep_closure[rel] = seen
 
+    lines_by_file: dict[str, dict[int, set[int]]] = defaultdict(dict)
+    file_cov_by_file: dict[str, set[int]] = defaultdict(set)
+    for key, idxs in line_to_idxs.items():
+        rel, ln_str = key.rsplit(":", 1)
+        ln = int(ln_str)
+        lines_by_file[rel][ln] = idxs
+        file_cov_by_file[rel].update(idxs)
+
+    if out_path.suffix == ".pkl":
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_dir = out_path.parent / "meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        file_ids = {}
+        ast_hashes = {}
+        test_methods_map = {}
+        for fid, (rel, info) in enumerate(file_data.items()):
+            file_ids[rel] = fid
+            ast_hashes[rel] = info["ast_hash"]
+            if info["test_methods"]:
+                test_methods_map[rel] = info["test_methods"]
+            with open(meta_dir / f"{fid}.pkl", "wb") as mf:
+                pickle.dump(
+                    {
+                        "line_to_idxs": lines_by_file.get(rel, {}),
+                        "file_cov_idxs": file_cov_by_file.get(rel, set()),
+                        "line_info": info["line_info"],
+                        "stmt_spans": info["stmt_spans"],
+                    },
+                    mf,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+
+        with open(out_path.parent / "readers.pkl", "wb") as rf:
+            pickle.dump(
+                {"attr_readers": dict(attr_readers), "name_readers": dict(name_readers)},
+                rf,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+        index_payload = {
+            "split": True,
+            "nodeids": nodeids,
+            "file_ids": file_ids,
+            "ast_hashes": ast_hashes,
+            "test_methods": test_methods_map,
+            "fixture_to_idxs": dict(fixture_to_idxs),
+            "dialect_to_idxs": dict(dialect_to_idxs),
+            "tok_to_idxs": dict(tok_to_idxs),
+            "parse_to_idxs": dict(parse_to_idxs),
+            "gen_init_to_idxs": dict(gen_init_to_idxs),
+            "gen_sql_to_idxs": dict(gen_sql_to_idxs),
+            "dialect_subclasses": dict(dialect_subclasses),
+            "parser_subclasses": dict(parser_subclasses),
+            "generator_subclasses": dict(generator_subclasses),
+            "tokenizer_subclasses": dict(tokenizer_subclasses),
+            "mod_attr_readers": {k: sorted(v) for k, v in mod_attr_readers.items()},
+            "mod_name_readers": {k: sorted(v) for k, v in mod_name_readers.items()},
+            "file_deps": file_dep_closure,
+        }
+        with open(out_path, "wb") as f:
+            pickle.dump(index_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        total_mb = (out_path.stat().st_size + (out_path.parent / "readers.pkl").stat().st_size + sum(p.stat().st_size for p in meta_dir.iterdir())) / 1e6
+        print(f"Built split {out_path} (index={out_path.stat().st_size / 1e6:.2f} MB, total={total_mb:.2f} MB) for {len(nodeids)} tests", flush=True)
+        return
+
     compact_file_data = {}
     for rel, info in file_data.items():
         compact_file_data[rel] = {
@@ -797,22 +873,16 @@ def build_all(repo_root: Path, out_path: Path, workers: int | None = None) -> No
         "mod_name_readers": {k: sorted(v) for k, v in mod_name_readers.items()},
         "file_deps": file_dep_closure,
     }
-
-    if out_path.suffix == ".pkl":
-        with open(out_path, "wb") as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        # JSON fallback for inspection
-        json_payload = {
-            k: (
-                {kk: sorted(vv) for kk, vv in v.items()}
-                if isinstance(v, dict) and v and isinstance(next(iter(v.values())), set)
-                else v
-            )
-            for k, v in payload.items()
-        }
-        with gzip.open(out_path, "wt", encoding="utf-8") as f:
-            json.dump(json_payload, f, separators=(",", ":"))
+    json_payload = {
+        k: (
+            {kk: sorted(vv) for kk, vv in v.items()}
+            if isinstance(v, dict) and v and isinstance(next(iter(v.values())), set)
+            else v
+        )
+        for k, v in payload.items()
+    }
+    with gzip.open(out_path, "wt", encoding="utf-8") as f:
+        json.dump(json_payload, f, separators=(",", ":"))
     print(f"Built {out_path} ({out_path.stat().st_size / 1e6:.2f} MB) for {len(nodeids)} tests", flush=True)
 
 

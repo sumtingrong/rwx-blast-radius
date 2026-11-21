@@ -1,4 +1,4 @@
-"""Blast Radius selector: dynamic line/fixture/dialect/component coverage + static AST/attr analysis + 0..8 worker packing."""
+"""Blast Radius selector: lazy split-pickle loading + dynamic/AST/component coverage + 0..8 worker packing."""
 from __future__ import annotations
 
 import ast
@@ -129,7 +129,6 @@ def pack_workers(test_nums: set[int], dur_ms: dict[int, int]) -> list[list[int]]
                 best_action = None
                 best_new_max = cur_max
 
-                # Try moving 1 test from hi -> any lighter worker j
                 for idx_t, t in enumerate(workers[hi]):
                     dt = dur_ms[t]
                     new_hi = loads[hi] - dt
@@ -142,7 +141,6 @@ def pack_workers(test_nums: set[int], dur_ms: dict[int, int]) -> list[list[int]]
                             best_new_max = cand_max
                             best_action = ("move", idx_t, j)
 
-                # If no improving single move, try 1-1 swap between hi and j
                 if best_action is None and len(ordered) <= 200:
                     for idx_a, ta in enumerate(workers[hi]):
                         da = dur_ms[ta]
@@ -186,7 +184,7 @@ def pack_workers(test_nums: set[int], dur_ms: dict[int, int]) -> list[list[int]]
     return [w for w in best_workers if w]
 
 
-def _load_maps(path: Path) -> dict:
+def _load_root(path: Path) -> dict:
     if path.suffix == ".pkl":
         with open(path, "rb") as f:
             return pickle.load(f)
@@ -203,41 +201,165 @@ def main() -> None:
         tests_by_file[t["file"]].append(t["number"])
     all_test_nums = {t["number"] for t in tests_raw}
 
-    maps = _load_maps(MAPS_PATH)
+    maps = _load_root(MAPS_PATH)
+    is_split = bool(maps.get("split"))
+    maps_dir = MAPS_PATH.parent
 
-    idx_to_num: dict[int, int] = {}
-    for idx, nodeid in enumerate(maps["nodeids"]):
-        if nodeid in id_to_num:
-            idx_to_num[idx] = id_to_num[nodeid]
+    idx_to_num_list = [id_to_num.get(nid, -1) for nid in maps["nodeids"]]
 
-    def remap_dict(raw: dict) -> dict[str, set[int]]:
-        out = {}
-        for k, v in raw.items():
-            s = {idx_to_num[i] for i in v if i in idx_to_num}
-            if s:
-                out[k] = s
+    def remap_idxs(idxs) -> set[int]:
+        if not idxs:
+            return set()
+        out = set()
+        for i in idxs:
+            num = idx_to_num_list[i]
+            if num >= 0:
+                out.add(num)
         return out
 
-    line_to_tests = remap_dict(maps["line_to_idxs"])
-    fixture_to_tests = remap_dict(maps["fixture_to_idxs"])
-    dialect_to_tests = remap_dict(maps["dialect_to_idxs"])
-    tok_to_tests = remap_dict(maps.get("tok_to_idxs", {}))
-    parse_to_tests = remap_dict(maps.get("parse_to_idxs", {}))
-    gen_init_to_tests = remap_dict(maps.get("gen_init_to_idxs", {}))
-    gen_sql_to_tests = remap_dict(maps.get("gen_sql_to_idxs", {}))
+    # Lazy remapping cache for small top-level dialect/fixture dicts
+    def make_lazy_dict(raw: dict) -> dict[str, set[int]]:
+        cache: dict[str, set[int]] = {}
+        class LazyMap(dict):
+            def get(self, key, default=None):
+                if key in cache:
+                    return cache[key]
+                v = raw.get(key)
+                if v is None:
+                    return default
+                res = remap_idxs(v)
+                cache[key] = res
+                return res
+            def __contains__(self, key):
+                return key in raw
+            def __getitem__(self, key):
+                res = self.get(key)
+                if res is None:
+                    raise KeyError(key)
+                return res
+        return LazyMap()
+
+    fixture_to_tests = make_lazy_dict(maps["fixture_to_idxs"])
+    dialect_to_tests = make_lazy_dict(maps["dialect_to_idxs"])
+    tok_to_tests = make_lazy_dict(maps.get("tok_to_idxs", {}))
+    parse_to_tests = make_lazy_dict(maps.get("parse_to_idxs", {}))
+    gen_init_to_tests = make_lazy_dict(maps.get("gen_init_to_idxs", {}))
+    gen_sql_to_tests = make_lazy_dict(maps.get("gen_sql_to_idxs", {}))
 
     dialect_subclasses = maps["dialect_subclasses"]
     parser_subclasses = maps["parser_subclasses"]
     generator_subclasses = maps["generator_subclasses"]
     tokenizer_subclasses = maps.get("tokenizer_subclasses", {})
-    file_data = maps["file_data"]
-    attr_readers = maps["attr_readers"]
-    name_readers = maps["name_readers"]
     mod_attr_readers = maps.get("mod_attr_readers", {})
     mod_name_readers = maps.get("mod_name_readers", {})
     file_deps = maps.get("file_deps", {})
 
-    # reverse_importers[target_rel] = test numbers of all test files that transitively import target_rel
+    if is_split:
+        file_ids = maps["file_ids"]
+        ast_hashes = maps["ast_hashes"]
+        test_methods_map = maps["test_methods"]
+        _readers_cache: dict | None = None
+
+        def get_readers() -> tuple[dict, dict]:
+            nonlocal _readers_cache
+            if _readers_cache is None:
+                with open(maps_dir / "readers.pkl", "rb") as rf:
+                    _readers_cache = pickle.load(rf)
+            return _readers_cache["attr_readers"], _readers_cache["name_readers"]
+
+        _meta_cache: dict[str, dict] = {}
+
+        def get_meta(rel: str) -> dict | None:
+            if rel in _meta_cache:
+                return _meta_cache[rel]
+            fid = file_ids.get(rel)
+            if fid is None:
+                _meta_cache[rel] = None
+                return None
+            with open(maps_dir / "meta" / f"{fid}.pkl", "rb") as mf:
+                m = pickle.load(mf)
+            _meta_cache[rel] = m
+            return m
+
+        def has_file(rel: str) -> bool:
+            return rel in file_ids
+
+        def get_ast_hash(rel: str) -> str | None:
+            return ast_hashes.get(rel)
+
+        def get_test_methods(rel: str) -> list:
+            return test_methods_map.get(rel, ())
+
+        def get_line_tests(rel: str, ln: int) -> set[int]:
+            m = get_meta(rel)
+            if not m:
+                return set()
+            return remap_idxs(m["line_to_idxs"].get(ln))
+
+        def get_file_cov(rel: str) -> set[int]:
+            m = get_meta(rel)
+            if not m:
+                return set()
+            return remap_idxs(m["file_cov_idxs"])
+
+        def get_line_info(rel: str, ln: int) -> dict:
+            m = get_meta(rel)
+            if not m:
+                return {}
+            li = m["line_info"]
+            return li.get(ln) or li.get(str(ln), {})
+
+        def get_stmt_span(rel: str, ln: int) -> list[int] | None:
+            m = get_meta(rel)
+            if not m:
+                return None
+            ss = m["stmt_spans"]
+            return ss.get(ln) or ss.get(str(ln))
+    else:
+        file_data = maps["file_data"]
+        legacy_attr_readers = maps["attr_readers"]
+        legacy_name_readers = maps["name_readers"]
+        legacy_lines = maps["line_to_idxs"]
+        legacy_file_cov: dict[str, list[int]] = defaultdict(list)
+        for key, idxs in legacy_lines.items():
+            rel_k, _ = key.rsplit(":", 1)
+            legacy_file_cov[rel_k].extend(idxs)
+
+        def get_readers() -> tuple[dict, dict]:
+            return legacy_attr_readers, legacy_name_readers
+
+        def has_file(rel: str) -> bool:
+            return rel in file_data
+
+        def get_ast_hash(rel: str) -> str | None:
+            fd = file_data.get(rel)
+            return fd.get("ast_hash") if fd else None
+
+        def get_test_methods(rel: str) -> list:
+            fd = file_data.get(rel)
+            return fd.get("test_methods", ()) if fd else ()
+
+        def get_line_tests(rel: str, ln: int) -> set[int]:
+            return remap_idxs(legacy_lines.get(f"{rel}:{ln}"))
+
+        def get_file_cov(rel: str) -> set[int]:
+            return remap_idxs(legacy_file_cov.get(rel))
+
+        def get_line_info(rel: str, ln: int) -> dict:
+            fd = file_data.get(rel)
+            if not fd:
+                return {}
+            li = fd["line_info"]
+            return li.get(ln) or li.get(str(ln), {})
+
+        def get_stmt_span(rel: str, ln: int) -> list[int] | None:
+            fd = file_data.get(rel)
+            if not fd:
+                return None
+            ss = fd["stmt_spans"]
+            return ss.get(ln) or ss.get(str(ln))
+
+    # Build transitive importer maps from file_deps (~100 entries, < 0.5ms)
     file_importers: dict[str, set[int]] = defaultdict(set)
     mod_importers: dict[str, set[str]] = defaultdict(set)
     for rel_src, deps in file_deps.items():
@@ -250,11 +372,6 @@ def main() -> None:
             mod_importers[d].add(rel_src)
         mod_importers[rel_src].add(rel_src)
 
-    file_cov_tests: dict[str, set[int]] = defaultdict(set)
-    for key, tset in line_to_tests.items():
-        rel, _ = key.rsplit(":", 1)
-        file_cov_tests[rel].update(tset)
-
     orig_src_cache: dict[str, str] = {}
 
     def get_orig(rel: str) -> str:
@@ -263,22 +380,13 @@ def main() -> None:
             orig_src_cache[rel] = p.read_text("utf-8") if p.exists() else ""
         return orig_src_cache[rel]
 
-    def get_line_info(fdata: dict, ln: int) -> dict:
-        li = fdata["line_info"]
-        return li.get(ln) or li.get(str(ln), {})
-
-    def get_stmt_span(fdata: dict, ln: int) -> list[int] | None:
-        ss = fdata["stmt_spans"]
-        return ss.get(ln) or ss.get(str(ln))
-
     def tests_for_line_or_span(rel: str, ln: int) -> set[int]:
-        out = set(line_to_tests.get(f"{rel}:{ln}", ()))
-        fdata = file_data.get(rel)
-        if fdata:
-            span = get_stmt_span(fdata, ln)
-            if span:
-                for sln in range(span[0], span[1] + 1):
-                    out.update(line_to_tests.get(f"{rel}:{sln}", ()))
+        out = get_line_tests(rel, ln)
+        span = get_stmt_span(rel, ln)
+        if span:
+            for sln in range(span[0], span[1] + 1):
+                if sln != ln:
+                    out.update(get_line_tests(rel, sln))
         return out
 
     def classify_class(cls_name: str) -> tuple[str, list[str]] | tuple[None, None]:
@@ -300,7 +408,7 @@ def main() -> None:
         elif r_rel == "sqlglot/parser.py" or r_rel.startswith("sqlglot/parsers/"):
             source = parse_to_tests or dialect_to_tests
         elif r_rel == "sqlglot/generator.py" or r_rel.startswith("sqlglot/generators/"):
-            r_info = get_line_info(file_data[r_rel], r_ln) if r_rel in file_data else {}
+            r_info = get_line_info(r_rel, r_ln)
             if r_info.get("func") == "__init__":
                 source = gen_init_to_tests or dialect_to_tests
             else:
@@ -309,13 +417,17 @@ def main() -> None:
             source = dialect_to_tests
         res: set[int] = set()
         for dn in d_names:
-            res.update(source.get(dn, ()))
+            t = source.get(dn)
+            if t:
+                res.update(t)
         return res
 
     def union_dialect_tests(d_names: list[str]) -> set[int]:
         res: set[int] = set()
         for dn in d_names:
-            res.update(dialect_to_tests.get(dn, ()))
+            t = dialect_to_tests.get(dn)
+            if t:
+                res.update(t)
         return res
 
     def select_for_patch(patch_text: str) -> set[int]:
@@ -341,8 +453,9 @@ def main() -> None:
                     if not non_comment:
                         continue
 
-                if rel in fixture_to_tests and fixture_to_tests[rel]:
-                    selected.update(fixture_to_tests[rel])
+                fx_tests = fixture_to_tests.get(rel)
+                if fx_tests:
+                    selected.update(fx_tests)
                 else:
                     if "tpc-h" in rel or "tpc-ds" in rel:
                         selected.update(tests_by_file["tests/test_executor.py"])
@@ -359,22 +472,21 @@ def main() -> None:
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
 
-                fdata = file_data.get(rel)
+                orig_hash = get_ast_hash(rel)
                 orig_src = get_orig(rel)
                 patched_src = apply_hunks(orig_src, fdiff["hunks"]) if orig_src else None
-                if patched_src is not None and fdata:
+                if patched_src is not None and orig_hash is not None:
                     try:
                         new_ast = ast.parse(patched_src)
                     except SyntaxError:
                         selected.update(file_importers.get(rel, all_test_nums))
                         continue
                     new_hash = hashlib.blake2b(ast.dump(new_ast).encode("utf-8"), digest_size=16).hexdigest()
-                    if new_hash == fdata["ast_hash"]:
+                    if new_hash == orig_hash:
                         continue
 
-                # If rel is a test file and no other test file imports it for non-test code, try method-level granularity
-                if rel in tests_by_file and fdata and fdata.get("test_methods"):
-                    test_methods = fdata["test_methods"]
+                test_methods = get_test_methods(rel)
+                if rel in tests_by_file and test_methods:
                     matched_tests: set[int] = set()
                     all_inside_test_methods = True
                     for h in fdiff["hunks"]:
@@ -439,23 +551,23 @@ def main() -> None:
                 selected.update(file_importers.get(rel, all_test_nums))
                 continue
 
-            fdata = file_data.get(rel)
+            orig_hash = get_ast_hash(rel)
             orig_src = get_orig(rel)
             patched_src = apply_hunks(orig_src, fdiff["hunks"]) if orig_src else None
-            if patched_src is not None and fdata:
+            if patched_src is not None and orig_hash is not None:
                 try:
                     new_ast = ast.parse(patched_src)
                 except SyntaxError:
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
                 new_hash = hashlib.blake2b(ast.dump(new_ast).encode("utf-8"), digest_size=16).hexdigest()
-                if new_hash == fdata["ast_hash"]:
+                if new_hash == orig_hash:
                     continue
 
             if rel.startswith("sqlglot/typing/"):
                 selected.update(tests_by_file.get("tests/test_typing.py", ()))
 
-            if not fdata:
+            if not has_file(rel):
                 selected.update(all_test_nums)
                 continue
 
@@ -480,7 +592,7 @@ def main() -> None:
                 for ln in candidate_lines:
                     if ln < 1:
                         continue
-                    info = get_line_info(fdata, ln)
+                    info = get_line_info(rel, ln)
                     if info.get("is_lambda"):
                         lr = info["lambda_range"]
                         for l2 in range(lr[0], lr[1] + 1):
@@ -496,11 +608,12 @@ def main() -> None:
                             fr = info["func_range"]
                             if ln <= fr[0] + 1:
                                 for l2 in range(fr[0], fr[1] + 1):
-                                    selected.update(line_to_tests.get(f"{rel}:{l2}", ()))
+                                    selected.update(get_line_tests(rel, l2))
                             elif not touched_old_lines:
                                 for delta in (-1, 1, -2, 2):
                                     selected.update(tests_for_line_or_span(rel, ln + delta))
                     elif "class_attr" in info:
+                        attr_readers, name_readers = get_readers()
                         cls_name, attr_name = info["class_attr"]
                         is_expr_class_attr = rel.startswith("sqlglot/expressions/") and attr_name in GENERIC_EXPR_ATTRS
                         reader_locs: list[str] = []
@@ -539,7 +652,6 @@ def main() -> None:
                             if attr_name:
                                 mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
                                 if is_expr_class_attr and cls_name:
-                                    # e.g. UNMERGABLE_ARGS = set(exp.Select.arg_types) accesses both cls_name and attr_name
                                     mod_cls_set = set(mod_attr_readers.get(cls_name, ())) | set(mod_name_readers.get(cls_name, ()))
                                     mod_matches = mod_attr_set & mod_cls_set & importers_of_rel
                                 else:
@@ -547,8 +659,9 @@ def main() -> None:
                                 for mrel in mod_matches:
                                     selected.update(file_importers.get(mrel, ()))
                         elif not is_expr_class_attr:
-                            selected.update(file_cov_tests.get(rel, ()))
+                            selected.update(get_file_cov(rel))
                     elif "module_var" in info:
+                        attr_readers, name_readers = get_readers()
                         var_name = info["module_var"]
                         importers_of_rel = mod_importers.get(rel, {rel})
                         reader_locs = []
@@ -572,9 +685,9 @@ def main() -> None:
                                 r_rel, r_ln_str = loc.rsplit(":", 1)
                                 selected.update(tests_for_line_or_span(r_rel, int(r_ln_str)))
                         elif not (var_name and (mod_name_readers.get(var_name) or mod_attr_readers.get(var_name))):
-                            selected.update(file_cov_tests.get(rel, ()))
+                            selected.update(get_file_cov(rel))
                     else:
-                        selected.update(file_cov_tests.get(rel, ()))
+                        selected.update(get_file_cov(rel))
 
         return selected
 

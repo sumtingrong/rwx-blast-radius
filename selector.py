@@ -21,6 +21,206 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 BASE_CLASSES = {"Dialect", "Parser", "BaseParser", "Generator", "Tokenizer", "JSONPathTokenizer", "_TokenizerBase"}
 ONCE_FUNCS = {"__new__", "__init_subclass__", "_build_dispatch"}
 GENERIC_EXPR_ATTRS = {"arg_types", "is_var_len_args", "_sql_names", "__slots__"}
+REVERSIBLE_CMPS = {
+    ("Is", "Eq"),
+    ("Eq", "Is"),
+    ("IsNot", "NotEq"),
+    ("NotEq", "IsNot"),
+    ("Lt", "LtE"),
+    ("LtE", "Lt"),
+    ("Gt", "GtE"),
+    ("GtE", "Gt"),
+}
+
+
+def is_comment_or_blank_only(hunks: list[dict], str_lines) -> bool:
+    for h in hunks:
+        old_ln = h["old_start"]
+        for hl in h["lines"]:
+            if not hl:
+                continue
+            tag = hl[0]
+            if tag == " ":
+                old_ln += 1
+            elif tag == "-":
+                body = hl[1:].lstrip()
+                if body and not body.startswith("#"):
+                    return False
+                if old_ln in str_lines:
+                    return False
+                old_ln += 1
+            elif tag == "+":
+                body = hl[1:].lstrip()
+                if body and not body.startswith("#"):
+                    return False
+                if old_ln in str_lines or (old_ln - 1) in str_lines:
+                    return False
+    return True
+
+
+def ast_equal(a, b) -> bool:
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            if not ast_equal(getattr(a, f), getattr(b, f)):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(ast_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _is_const_none_or_bool(n: ast.AST) -> bool:
+    return isinstance(n, ast.Constant) and (n.value is None or isinstance(n.value, bool))
+
+
+def _static_ast_key_tag(k: ast.AST) -> str | None:
+    if isinstance(k, ast.Constant):
+        if isinstance(k.value, (str, int, float, bool)) or k.value is None:
+            return f"s:{k.value!r}"
+        return None
+    if isinstance(k, ast.Attribute):
+        if isinstance(k.value, ast.Name):
+            if k.value.id == "exp":
+                return f"t:{k.attr}"
+            if k.value.id == "TokenType":
+                return f"e:TokenType.{k.attr}"
+        elif isinstance(k.value, ast.Attribute) and k.value.attr == "TokenType":
+            return f"e:TokenType.{k.attr}"
+    return None
+
+
+def _diff_dict_nodes(old_d: ast.Dict, new_d: ast.Dict):
+    old_spreads = []
+    old_map = {}
+    for k, v in zip(old_d.keys, old_d.values):
+        if k is None:
+            old_spreads.append(v)
+        else:
+            kt = _static_ast_key_tag(k)
+            if kt is None or kt in old_map:
+                return None
+            old_map[kt] = v
+
+    new_spreads = []
+    new_map = {}
+    for k, v in zip(new_d.keys, new_d.values):
+        if k is None:
+            new_spreads.append(v)
+        else:
+            kt = _static_ast_key_tag(k)
+            if kt is None or kt in new_map:
+                return None
+            new_map[kt] = v
+
+    if len(old_spreads) != len(new_spreads) or not all(ast_equal(ov, nv) for ov, nv in zip(old_spreads, new_spreads)):
+        return None
+    if set(old_map.keys()) != set(new_map.keys()):
+        return None
+
+    changed_keys = set()
+    lambda_pairs = []
+    for k, ov in old_map.items():
+        nv = new_map[k]
+        if not ast_equal(ov, nv):
+            if isinstance(ov, ast.Lambda) and isinstance(nv, ast.Lambda) and ast_equal(ov.args, nv.args):
+                lambda_pairs.append((ov.body, nv.body))
+            else:
+                changed_keys.add(k)
+    return changed_keys, lambda_pairs
+
+
+def analyze_diff_asts(old_tree: ast.AST, new_tree: ast.AST):
+    cmp_swaps = []
+    dict_diffs = []
+    other_spans = []
+
+    def walk_cmp(o: ast.AST, n: ast.AST, cls_stack: list[str]) -> bool:
+        if type(o) is not type(n):
+            return False
+
+        if isinstance(o, ast.ClassDef):
+            if (
+                o.name != n.name
+                or len(o.body) != len(n.body)
+                or not ast_equal(o.bases, n.bases)
+                or not ast_equal(o.keywords, n.keywords)
+                or not ast_equal(o.decorator_list, n.decorator_list)
+            ):
+                return False
+            cls_stack.append(o.name)
+            for ob, nb in zip(o.body, n.body):
+                if not walk_cmp(ob, nb, cls_stack):
+                    cls_stack.pop()
+                    return False
+            cls_stack.pop()
+            return True
+
+        if cls_stack and isinstance(o, (ast.Assign, ast.AnnAssign)) and isinstance(o.value, ast.Dict) and isinstance(n.value, ast.Dict):
+            target_id = None
+            if isinstance(o, ast.Assign) and len(o.targets) == len(n.targets) == 1:
+                if isinstance(o.targets[0], ast.Name) and isinstance(n.targets[0], ast.Name) and o.targets[0].id == n.targets[0].id:
+                    target_id = o.targets[0].id
+            elif isinstance(o, ast.AnnAssign):
+                if (
+                    isinstance(o.target, ast.Name)
+                    and isinstance(n.target, ast.Name)
+                    and o.target.id == n.target.id
+                    and ast_equal(o.annotation, n.annotation)
+                ):
+                    target_id = o.target.id
+            if target_id is not None:
+                res = _diff_dict_nodes(o.value, n.value)
+                if res is not None:
+                    changed_keys, lambda_pairs = res
+                    if changed_keys:
+                        dict_diffs.append((".".join(cls_stack), target_id, o.lineno, o.end_lineno or o.lineno, changed_keys))
+                    for ob, nb in lambda_pairs:
+                        if not walk_cmp(ob, nb, cls_stack):
+                            return False
+                    return True
+
+        if isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1:
+            op_pair = (type(o.ops[0]).__name__, type(n.ops[0]).__name__)
+            if op_pair in REVERSIBLE_CMPS:
+                if ast_equal(o.left, n.left) and len(o.comparators) == len(n.comparators) == 1 and ast_equal(o.comparators[0], n.comparators[0]):
+                    if op_pair[0] in ("Eq", "NotEq"):
+                        if not (_is_const_none_or_bool(o.left) or _is_const_none_or_bool(o.comparators[0])):
+                            other_spans.append((o.lineno, o.end_lineno or o.lineno))
+                            return True
+                    cmp_swaps.append((o.lineno, o.col_offset, op_pair[0]))
+                    return True
+                other_spans.append((o.lineno, o.end_lineno or o.lineno))
+                return True
+
+        for field in o._fields:
+            ov = getattr(o, field)
+            nv = getattr(n, field)
+            if isinstance(ov, list) and isinstance(nv, list):
+                if len(ov) != len(nv):
+                    return False
+                for oi, ni in zip(ov, nv):
+                    if isinstance(oi, ast.AST) and isinstance(ni, ast.AST):
+                        if not walk_cmp(oi, ni, cls_stack):
+                            return False
+                    elif oi != ni:
+                        if hasattr(o, "lineno"):
+                            other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                            return True
+                        return False
+            elif isinstance(ov, ast.AST) and isinstance(nv, ast.AST):
+                if not walk_cmp(ov, nv, cls_stack):
+                    return False
+            elif ov != nv:
+                if hasattr(o, "lineno"):
+                    other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                    return True
+                return False
+        return True
+
+    ok = walk_cmp(old_tree, new_tree, [])
+    return cmp_swaps, dict_diffs, other_spans, not ok
 
 
 def parse_patch(patch_text: str) -> list[dict]:
@@ -253,12 +453,18 @@ def main() -> None:
     mod_attr_readers = maps.get("mod_attr_readers", {})
     mod_name_readers = maps.get("mod_name_readers", {})
     file_deps = maps.get("file_deps", {})
+    cmp_diff_to_tests = make_lazy_dict(maps.get("cmp_diff_to_idxs", {}))
+    scalar_attr_to_tests = make_lazy_dict(maps.get("scalar_attr_to_idxs", {}))
+    cls_sub_qualnames = maps.get("cls_sub_qualnames", {})
+    tracked_dicts = {tuple(x) for x in maps.get("tracked_dicts", ())}
+    scalar_attrs = set(maps.get("scalar_attrs", ()))
 
     if is_split:
         file_ids = maps["file_ids"]
         ast_hashes = maps["ast_hashes"]
         test_methods_map = maps["test_methods"]
         _readers_cache: dict | None = None
+        _dict_keys_cache: dict | None = None
 
         def get_readers() -> tuple[dict, dict]:
             nonlocal _readers_cache
@@ -266,6 +472,17 @@ def main() -> None:
                 with open(maps_dir / "readers.pkl", "rb") as rf:
                     _readers_cache = pickle.load(rf)
             return _readers_cache["attr_readers"], _readers_cache["name_readers"]
+
+        def get_dict_keys() -> dict:
+            nonlocal _dict_keys_cache
+            if _dict_keys_cache is None:
+                dk_path = maps_dir / "dict_keys.pkl"
+                if dk_path.exists():
+                    with open(dk_path, "rb") as dk:
+                        _dict_keys_cache = pickle.load(dk)
+                else:
+                    _dict_keys_cache = {}
+            return _dict_keys_cache
 
         _meta_cache: dict[str, dict] = {}
 
@@ -315,6 +532,10 @@ def main() -> None:
                 return None
             ss = m["stmt_spans"]
             return ss.get(ln) or ss.get(str(ln))
+
+        def get_str_lines(rel: str):
+            m = get_meta(rel)
+            return m.get("str_lines", ()) if m else ()
     else:
         file_data = maps["file_data"]
         legacy_attr_readers = maps["attr_readers"]
@@ -327,6 +548,9 @@ def main() -> None:
 
         def get_readers() -> tuple[dict, dict]:
             return legacy_attr_readers, legacy_name_readers
+
+        def get_dict_keys() -> dict:
+            return {}
 
         def has_file(rel: str) -> bool:
             return rel in file_data
@@ -359,6 +583,10 @@ def main() -> None:
             ss = fd["stmt_spans"]
             return ss.get(ln) or ss.get(str(ln))
 
+        def get_str_lines(rel: str):
+            fd = file_data.get(rel)
+            return fd.get("str_lines", ()) if fd else ()
+
     # Build transitive importer maps from file_deps (~100 entries, < 0.5ms)
     file_importers: dict[str, set[int]] = defaultdict(set)
     mod_importers: dict[str, set[str]] = defaultdict(set)
@@ -373,12 +601,20 @@ def main() -> None:
         mod_importers[rel_src].add(rel_src)
 
     orig_src_cache: dict[str, str] = {}
+    orig_ast_cache: dict[str, ast.AST] = {}
 
     def get_orig(rel: str) -> str:
         if rel not in orig_src_cache:
             p = REF / rel
             orig_src_cache[rel] = p.read_text("utf-8") if p.exists() else ""
         return orig_src_cache[rel]
+
+    def get_orig_ast(rel: str, orig_src: str) -> ast.AST:
+        t = orig_ast_cache.get(rel)
+        if t is None:
+            t = ast.parse(orig_src)
+            orig_ast_cache[rel] = t
+        return t
 
     def tests_for_line_or_span(rel: str, ln: int) -> set[int]:
         out = get_line_tests(rel, ln)
@@ -430,6 +666,14 @@ def main() -> None:
                 res.update(t)
         return res
 
+    def tests_for_test_line(r_rel: str, r_ln: int) -> set[int]:
+        for cls_n, meth_n, s_ln, e_ln in get_test_methods(r_rel):
+            if s_ln <= r_ln <= e_ln:
+                tnum = id_to_num.get(f"{r_rel}::{cls_n}::{meth_n}")
+                if tnum is not None:
+                    return {tnum}
+        return set(tests_by_file.get(r_rel, ()))
+
     def select_for_patch(patch_text: str) -> set[int]:
         selected: set[int] = set()
         for fdiff in parse_patch(patch_text):
@@ -472,17 +716,19 @@ def main() -> None:
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
 
-                orig_hash = get_ast_hash(rel)
+                if has_file(rel) and is_comment_or_blank_only(fdiff["hunks"], get_str_lines(rel)):
+                    continue
+
                 orig_src = get_orig(rel)
                 patched_src = apply_hunks(orig_src, fdiff["hunks"]) if orig_src else None
-                if patched_src is not None and orig_hash is not None:
+                if patched_src is not None and orig_src:
                     try:
                         new_ast = ast.parse(patched_src)
                     except SyntaxError:
                         selected.update(file_importers.get(rel, all_test_nums))
                         continue
-                    new_hash = hashlib.blake2b(ast.dump(new_ast).encode("utf-8"), digest_size=16).hexdigest()
-                    if new_hash == orig_hash:
+                    old_ast = get_orig_ast(rel, orig_src)
+                    if ast_equal(old_ast, new_ast):
                         continue
 
                 test_methods = get_test_methods(rel)
@@ -551,18 +797,28 @@ def main() -> None:
                 selected.update(file_importers.get(rel, all_test_nums))
                 continue
 
-            orig_hash = get_ast_hash(rel)
+            if has_file(rel) and is_comment_or_blank_only(fdiff["hunks"], get_str_lines(rel)):
+                continue
+
             orig_src = get_orig(rel)
             patched_src = apply_hunks(orig_src, fdiff["hunks"]) if orig_src else None
-            if patched_src is not None and orig_hash is not None:
+            cmp_swaps = []
+            dict_diffs = []
+            other_spans: list[tuple[int, int]] = []
+            mismatch = False
+            use_ast_diff = False
+
+            if patched_src is not None and orig_src:
                 try:
                     new_ast = ast.parse(patched_src)
                 except SyntaxError:
                     selected.update(file_importers.get(rel, all_test_nums))
                     continue
-                new_hash = hashlib.blake2b(ast.dump(new_ast).encode("utf-8"), digest_size=16).hexdigest()
-                if new_hash == orig_hash:
+                old_ast = get_orig_ast(rel, orig_src)
+                cmp_swaps, dict_diffs, other_spans, mismatch = analyze_diff_asts(old_ast, new_ast)
+                if not mismatch and not cmp_swaps and not dict_diffs and not other_spans:
                     continue
+                use_ast_diff = True
 
             if rel.startswith("sqlglot/typing/"):
                 selected.update(tests_by_file.get("tests/test_typing.py", ()))
@@ -570,6 +826,35 @@ def main() -> None:
             if not has_file(rel):
                 selected.update(all_test_nums)
                 continue
+
+            if use_ast_diff and not mismatch:
+                for ln, col, op_name in cmp_swaps:
+                    linfo = get_line_info(rel, ln)
+                    if linfo.get("func") or linfo.get("is_lambda"):
+                        selected.update(cmp_diff_to_tests.get(f"{rel}:{ln}:{col}:{op_name}", ()))
+                    else:
+                        other_spans.append((ln, ln))
+
+                if dict_diffs:
+                    dk_map = None
+                    for cls_name, attr_name, d_ln, d_end_ln, changed_keys in dict_diffs:
+                        if (cls_name, attr_name) in tracked_dicts:
+                            if dk_map is None:
+                                dk_map = get_dict_keys()
+                            sub_cls_list = cls_sub_qualnames.get(cls_name, (cls_name,))
+                            for sub_c in sub_cls_list:
+                                full_idxs = dk_map.get(f"{sub_c}|{attr_name}|__FULL__")
+                                if full_idxs:
+                                    selected.update(remap_idxs(full_idxs))
+                                for kt in changed_keys:
+                                    k_idxs = dk_map.get(f"{sub_c}|{attr_name}|{kt}")
+                                    if k_idxs:
+                                        selected.update(remap_idxs(k_idxs))
+                        else:
+                            other_spans.append((d_ln, d_end_ln))
+
+                if not other_spans:
+                    continue
 
             for h in fdiff["hunks"]:
                 old_ln = h["old_start"]
@@ -587,6 +872,14 @@ def main() -> None:
                     elif tag == "+":
                         insertion_anchors.append(old_ln - 1)
                         insertion_anchors.append(old_ln)
+
+                if use_ast_diff and not mismatch:
+                    touched_old_lines = [
+                        ln for ln in touched_old_lines if any(s <= ln <= e for s, e in other_spans)
+                    ]
+                    insertion_anchors = [
+                        ln for ln in insertion_anchors if any((s - 1) <= ln <= (e + 1) for s, e in other_spans)
+                    ]
 
                 candidate_lines = touched_old_lines if touched_old_lines else insertion_anchors
                 for ln in candidate_lines:
@@ -606,7 +899,8 @@ def main() -> None:
                             selected.update(cov_here)
                         else:
                             fr = info["func_range"]
-                            if ln <= fr[0] + 1:
+                            sig_end = info.get("sig_end", fr[0] + 1)
+                            if ln <= sig_end:
                                 for l2 in range(fr[0], fr[1] + 1):
                                     selected.update(get_line_tests(rel, l2))
                             elif not touched_old_lines:
@@ -636,14 +930,32 @@ def main() -> None:
 
                         if d_names is not None:
                             if reader_locs:
-                                matched = set()
+                                sqlglot_matched = set()
+                                has_sqlglot_reader = False
+                                test_matched = set()
                                 for loc in reader_locs:
                                     r_rel, r_ln_str = loc.rsplit(":", 1)
                                     r_ln = int(r_ln_str)
-                                    t_here = tests_for_reader_loc(r_rel, r_ln)
-                                    if t_here:
-                                        matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
-                                selected.update(matched)
+                                    if r_rel.startswith("tests/"):
+                                        test_matched.update(tests_for_test_line(r_rel, r_ln))
+                                    else:
+                                        has_sqlglot_reader = True
+                                        t_here = tests_for_reader_loc(r_rel, r_ln)
+                                        if t_here:
+                                            sqlglot_matched.update(t_here & component_tests_for_reader(d_names, r_rel, r_ln))
+                                if has_sqlglot_reader and attr_name in scalar_attrs:
+                                    sc_tests = set()
+                                    sc_keys = set(d_names)
+                                    if cls_name:
+                                        sc_keys.update(cls_sub_qualnames.get(cls_name, (cls_name,)))
+                                    for k in sc_keys:
+                                        t = scalar_attr_to_tests.get(f"{k}|{attr_name}")
+                                        if t:
+                                            sc_tests.update(t)
+                                    selected.update(sqlglot_matched & sc_tests)
+                                else:
+                                    selected.update(sqlglot_matched)
+                                selected.update(test_matched)
                             else:
                                 selected.update(union_dialect_tests(d_names))
                             if attr_name:
@@ -653,7 +965,11 @@ def main() -> None:
                         elif reader_locs:
                             for loc in reader_locs:
                                 r_rel, r_ln_str = loc.rsplit(":", 1)
-                                selected.update(tests_for_reader_loc(r_rel, int(r_ln_str)))
+                                r_ln = int(r_ln_str)
+                                if r_rel.startswith("tests/"):
+                                    selected.update(tests_for_test_line(r_rel, r_ln))
+                                else:
+                                    selected.update(tests_for_reader_loc(r_rel, r_ln))
                             if attr_name:
                                 mod_attr_set = set(mod_attr_readers.get(attr_name, ()))
                                 if is_expr_class_attr and cls_name:

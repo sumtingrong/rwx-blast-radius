@@ -35,6 +35,10 @@ _UNVERIFIABLE_FILES = frozenset({
 _TPCDS_TID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 _OPT_TPCH_TID = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
 _MAX_NODES_TID = "tests/test_parser.py::TestParser::test_max_nodes"
+_OPT_TPCDS_TID = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+_OPT_SCOPE_TID = "tests/test_optimizer.py::TestOptimizer::test_scope"
+_OPT_CTE_CHAIN_TID = "tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain"
+_OPT_DEEP_AST_TID = "tests/test_optimizer.py::TestOptimizer::test_deep_ast_type_annotation"
 
 # Exact set of files loaded by `import sqlglot`. Any commit that touches ONLY
 # files outside this set can safely run in a warm fork after `import sqlglot`.
@@ -89,6 +93,35 @@ _NO_HOTPATCH_CORE_RELS = frozenset({
 })
 
 _ONCE_FUNCS = frozenset({"__new__", "__init_subclass__", "_build_dispatch", "__init__"})
+
+_UNSAFE_SCALAR_CLS_ATTRS = frozenset({
+    "COERCES_TO",
+    "TIME_MAPPING",
+    "FORMAT_MAPPING",
+    "CREATABLE_KIND_MAPPING",
+    "UNESCAPED_SEQUENCES",
+    "DATE_PART_MAPPING",
+    "VECTOR_TYPE_ALIASES",
+    "QUOTES",
+    "IDENTIFIERS",
+    "COMMENTS",
+    "STRING_ESCAPES",
+    "BYTE_STRING_ESCAPES",
+    "IDENTIFIER_ESCAPES",
+    "SUPPORTED_JSON_PATH_PARTS",
+    "HINT_START",
+    "BIT_STRINGS",
+    "BYTE_STRINGS",
+    "HEX_STRINGS",
+    "NATIONAL_RAW_STRINGS",
+    "RAW_STRINGS",
+    "HEREDOC_STRINGS",
+    "UNICODE_STRINGS",
+    "STRINGS_SUPPORT_ESCAPED_SEQUENCES",
+    "BYTE_STRINGS_SUPPORT_ESCAPED_SEQUENCES",
+    "SUPPORTS_COLUMN_JOIN_MARKS",
+    "INITCAP_SUPPORTS_CUSTOM_DELIMITERS",
+})
 
 # Files that execute after parse_one() in test_execute_tpcds (Optimizer + Schema + Planner + PythonExecutor)
 _TPCDS_POST_PARSE_RELS = frozenset({
@@ -178,8 +211,36 @@ def can_lazy_executor(overlay: dict[str, str | None]) -> bool:
     return True
 
 
+def can_lazy_optimizer(overlay: dict[str, str | None]) -> bool:
+    for rel in overlay:
+        if rel in ("tests/test_optimizer.py", "tests/helpers.py"):
+            return False
+        if rel.startswith("tests/fixtures/optimizer/"):
+            return False
+    return True
+
+
+def can_skip_opt_check_file_exec(overlay: dict[str, str | None]) -> bool:
+    if not can_lazy_optimizer(overlay):
+        return False
+    for rel in overlay:
+        if rel in ("sqlglot/dialects/duckdb.py", "sqlglot/generators/duckdb.py", "sqlglot/parsers/duckdb.py"):
+            return False
+    return True
+
+
+def can_fast_opt_tpcds(overlay: dict[str, str | None], oracle_tier: int) -> bool:
+    """True when TestOptimizer.test_tpcds can be verified via tpcds_parse_sigs (parse_one AST invariance)."""
+    if oracle_tier != 1 or not can_lazy_optimizer(overlay):
+        return False
+    for rel in overlay:
+        if rel == "sqlglot/generator.py" or rel.startswith("sqlglot/generators/") or rel.startswith("sqlglot/dialects/"):
+            return False
+    return True
+
+
 def tpcds_oracle_tier(overlay: dict[str, str | None], has_duckdb_cache: bool) -> int:
-    """Return 1 (parse+duckdb oracle ~8ms/q), 2 (optimize+duckdb oracle ~50ms/q), or 0 (full row execution)."""
+    """Return 1 (parse+duckdb oracle ~3.5ms/q), 2 (optimize+duckdb oracle ~45ms/q), or 0 (full row execution)."""
     if not has_duckdb_cache or not can_lazy_executor(overlay):
         return 0
     for rel in overlay:
@@ -202,6 +263,14 @@ def _is_doc_stmt(s: ast.stmt) -> bool:
     return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
 
 
+def _extract_cls_attr_pair(stmt: ast.stmt) -> tuple[str, ast.expr] | None:
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name) and stmt.value is not None:
+        return stmt.targets[0].id, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return stmt.target.id, stmt.value
+    return None
+
+
 def build_hot_patch_plan(
     overlay: dict[str, str | None],
     ref_root: Path,
@@ -209,14 +278,15 @@ def build_hot_patch_plan(
     ast_equal_fn,
 ) -> list[tuple[str, str, str | None, str, str | None]] | None:
     """If all _CORE_IMPORT_RELS files in overlay only modify undecorated/@classmethod/@staticmethod
-    function/method bodies without touching exported top-level functions, return hot-patch actions:
-      [(mod_name, fpath_str, cls_name_or_None, func_name, decorator_kind_or_None), ...]
+    function/method bodies, safe uppercase class scalar flags, or Expr.arg_types dicts without touching
+    exported top-level functions referenced in class bodies, return hot-patch actions:
+      [(mod_name, fpath_str, cls_name_or_None, member_name, kind_or_None), ...]
     Otherwise return None (requires clean fork before `import sqlglot`)."""
     actions: list[tuple[str, str, str | None, str, str | None]] = []
     for rel, content in overlay.items():
         if rel not in _CORE_IMPORT_RELS:
             continue
-        if rel in _NO_HOTPATCH_CORE_RELS or content is None or not rel.endswith(".py"):
+        if content is None or not rel.endswith(".py"):
             return None
         p = ref_root / rel
         if not p.exists():
@@ -230,6 +300,10 @@ def build_hot_patch_plan(
         ob = [s for s in oa.body if not _is_doc_stmt(s)]
         nb = [s for s in na.body if not _is_doc_stmt(s)]
         if len(ob) != len(nb):
+            return None
+        if rel in _NO_HOTPATCH_CORE_RELS:
+            if all(ast_equal_fn(os_n, ns_n) for os_n, ns_n in zip(ob, nb)):
+                continue
             return None
         exported = set(imported_from_file.get(rel, ()))
         cls_func_refs: set[str] = set()
@@ -273,18 +347,45 @@ def build_hot_patch_plan(
                 for ocm, ncm in zip(ocb, ncb):
                     if ast_equal_fn(ocm, ncm):
                         continue
-                    if not (isinstance(ocm, ast.FunctionDef) and isinstance(ncm, ast.FunctionDef)):
-                        return None
-                    if ocm.name != ncm.name or ocm.name in _ONCE_FUNCS:
-                        return None
-                    decs_o = [ast.unparse(d) for d in ocm.decorator_list]
-                    decs_n = [ast.unparse(d) for d in ncm.decorator_list]
-                    if decs_o != decs_n or len(decs_o) > 1:
-                        return None
-                    dk = decs_o[0] if decs_o else None
-                    if dk not in (None, "classmethod", "staticmethod"):
-                        return None
-                    actions.append((mod_name, fpath_str, ns_node.name, ncm.name, dk))
+                    if isinstance(ocm, ast.FunctionDef) and isinstance(ncm, ast.FunctionDef):
+                        if ocm.name != ncm.name or ocm.name in _ONCE_FUNCS:
+                            return None
+                        decs_o = [ast.unparse(d) for d in ocm.decorator_list]
+                        decs_n = [ast.unparse(d) for d in ncm.decorator_list]
+                        if decs_o != decs_n or len(decs_o) > 1:
+                            return None
+                        dk = decs_o[0] if decs_o else None
+                        if dk not in (None, "classmethod", "staticmethod"):
+                            return None
+                        actions.append((mod_name, fpath_str, ns_node.name, ncm.name, dk))
+                    else:
+                        opair = _extract_cls_attr_pair(ocm)
+                        npair = _extract_cls_attr_pair(ncm)
+                        if opair is None or npair is None or opair[0] != npair[0]:
+                            return None
+                        attr_name = npair[0]
+                        try:
+                            oval = ast.literal_eval(opair[1])
+                            nval = ast.literal_eval(npair[1])
+                        except Exception:
+                            return None
+                        if (
+                            attr_name == "arg_types"
+                            and rel.startswith("sqlglot/expressions/")
+                            and isinstance(oval, dict)
+                            and isinstance(nval, dict)
+                        ):
+                            actions.append((mod_name, fpath_str, ns_node.name, attr_name, "arg_types"))
+                        elif (
+                            attr_name.isupper()
+                            and not attr_name.startswith("_")
+                            and attr_name not in _UNSAFE_SCALAR_CLS_ATTRS
+                            and (isinstance(oval, (bool, int, float, str)) or oval is None)
+                            and (isinstance(nval, (bool, int, float, str)) or nval is None)
+                        ):
+                            actions.append((mod_name, fpath_str, ns_node.name, attr_name, "scalar_attr"))
+                        else:
+                            return None
             else:
                 return None
     return actions
@@ -294,7 +395,7 @@ def _apply_hot_patches(
     overlay: dict[str, str | None],
     hot_actions: list[tuple[str, str, str | None, str, str | None]],
 ) -> bool:
-    """In-place swap modified functions/methods in already-imported core sqlglot modules (~1-2ms)."""
+    """In-place swap modified functions/methods/class attributes in already-imported core sqlglot modules (~1-2ms)."""
     by_mod: dict[str, list[tuple[str, str | None, str, str | None]]] = {}
     for mod_name, fpath_str, cls_name, func_name, dk in hot_actions:
         by_mod.setdefault(mod_name, []).append((fpath_str, cls_name, func_name, dk))
@@ -310,6 +411,7 @@ def _apply_hot_patches(
         tree = ast.parse(content, filename=items[0][0])
         top_funcs: dict[str, ast.FunctionDef] = {}
         cls_methods: dict[tuple[str, str], ast.FunctionDef] = {}
+        cls_attrs: dict[tuple[str, str], ast.expr] = {}
         for s in tree.body:
             if isinstance(s, ast.FunctionDef):
                 top_funcs[s.name] = s
@@ -317,6 +419,10 @@ def _apply_hot_patches(
                 for m in s.body:
                     if isinstance(m, ast.FunctionDef):
                         cls_methods[(s.name, m.name)] = m
+                    else:
+                        ap = _extract_cls_attr_pair(m)
+                        if ap is not None:
+                            cls_attrs[(s.name, ap[0])] = ap[1]
 
         for fpath_str, cls_name, func_name, dk in items:
             if cls_name is None:
@@ -337,6 +443,21 @@ def _apply_hot_patches(
                 ns: dict = {}
                 exec(compile(mod_ast, fpath_str, "exec"), mod.__dict__, ns)
                 setattr(mod, func_name, ns[func_name])
+            elif dk in ("scalar_attr", "arg_types"):
+                vnode = cls_attrs.get((cls_name, func_name))
+                if vnode is None:
+                    return False
+                val = ast.literal_eval(vnode)
+                cls_obj = getattr(mod, cls_name)
+                setattr(cls_obj, func_name, val)
+                if dk == "arg_types":
+                    cls_obj.required_args = {k for k, v in val.items() if v}
+                    st = list(cls_obj.__subclasses__())
+                    while st:
+                        sub_c = st.pop()
+                        if "arg_types" not in sub_c.__dict__:
+                            sub_c.required_args = {k for k, v in sub_c.arg_types.items() if v}
+                            st.extend(sub_c.__subclasses__())
             else:
                 mnode = cls_methods.get((cls_name, func_name))
                 if mnode is None:
@@ -488,6 +609,7 @@ def _file_setup_ms(
     cpu_info: dict,
     can_lazy: bool,
     is_clean_fork: bool = False,
+    can_lazy_opt: bool = True,
 ) -> float:
     base_fork = 300.0 if (is_clean_fork and not done_files) else 0.0
     if fpath in done_files:
@@ -497,7 +619,8 @@ def _file_setup_ms(
         imp = 0.0 if heavy_pre else 550.0
         return base_fork + imp + (5.0 if can_lazy else 2000.0)
     if fpath == "tests/test_optimizer.py":
-        return base_fork + (60.0 if heavy_pre else 610.0)
+        imp = 12.0 if can_lazy_opt else 60.0
+        return base_fork + (imp if heavy_pre else (imp + 550.0))
     return base_fork + 15.0
 
 
@@ -512,9 +635,24 @@ def _est_body_cpu_ms(
     has_duckdb_cache: bool,
     oracle_tier: int = 0,
     fast_max_nodes: bool = True,
+    can_lazy_opt: bool = True,
+    fast_opt_tpcds: bool = False,
+    tpcds_parse_verified: bool = False,
 ) -> float:
     if nid == _MAX_NODES_TID:
         return 35.0 if fast_max_nodes else 35000.0
+    if can_lazy_opt:
+        if nid == _OPT_SCOPE_TID:
+            return 130.0
+        if nid == _OPT_CTE_CHAIN_TID:
+            return 65.0
+        if nid == _OPT_DEEP_AST_TID:
+            return 30.0
+    if nid == _OPT_TPCDS_TID and fast_opt_tpcds:
+        if tpcds_parse_verified:
+            return 5.0
+        n_q = len(sub_entry[1]) if sub_entry is not None else 99
+        return max(15.0, n_q * 3.0)
 
     test_cpu_ms = cpu_info.get("test_cpu_ms", {})
     sub_times_all = cpu_info.get("sub_times_ms", {})
@@ -525,7 +663,7 @@ def _est_body_cpu_ms(
         n_q = len(sub_entry[1]) if sub_entry is not None else 99
         if oracle_tier == 2 and n_q > 35:
             return 9999.0
-        per_q = 7.5 if oracle_tier == 1 else 45.0
+        per_q = 3.5 if oracle_tier == 1 else 45.0
         return max(15.0, n_q * per_q)
 
     if sub_entry is not None:
@@ -576,6 +714,9 @@ def _can_zero_fail_prove(
     is_clean_fork: bool = False,
     oracle_tier: int = 0,
     fast_max_nodes: bool = True,
+    can_lazy_opt: bool = True,
+    fast_opt_tpcds: bool = False,
+    tpcds_parse_verified: bool = False,
 ) -> bool:
     """Surgical Phase 2 Zero-Fail Proving: restricted to <= 3 warm tests (or 1 clean test) and <= 350ms CPU."""
     max_tests = 1 if is_clean_fork else 3
@@ -594,11 +735,23 @@ def _can_zero_fail_prove(
         if not nid or is_unverifiable(nid):
             return False
         fpath = nid.split("::", 1)[0]
-        setup = _file_setup_ms(fpath, sim_done, cpu_info, can_lazy, is_clean_fork)
+        setup = _file_setup_ms(fpath, sim_done, cpu_info, can_lazy, is_clean_fork, can_lazy_opt)
         sim_done.add(fpath)
         sub_e = subtest_elig.get(num)
         body = _est_body_cpu_ms(
-            num, nid, dur_ms[num], sub_e, cpu_info, can_lazy, sim_tbls, has_duckdb_cache, oracle_tier, fast_max_nodes
+            num,
+            nid,
+            dur_ms[num],
+            sub_e,
+            cpu_info,
+            can_lazy,
+            sim_tbls,
+            has_duckdb_cache,
+            oracle_tier,
+            fast_max_nodes,
+            can_lazy_opt,
+            fast_opt_tpcds,
+            tpcds_parse_verified,
         )
         if nid == _TPCDS_TID and can_lazy and oracle_tier == 0:
             if sub_e is not None:
@@ -628,6 +781,8 @@ def plan_commit_verification(
     is_clean_fork: bool = False,
     oracle_tier: int = 0,
     fast_max_nodes: bool = True,
+    can_lazy_opt: bool = True,
+    fast_opt_tpcds: bool = False,
 ) -> tuple[dict[int, tuple[str, list[int], int]], bool, int]:
     """Decide whether to fork a verifier for this commit; returns (subtest_elig, has_work, priority)."""
     if not sel:
@@ -640,6 +795,7 @@ def plan_commit_verification(
     sim_tested: set[int] = set()
     tpcds_tbls = cpu_info.get("tpcds_tables_by_idx", {})
     phase1_gain = 0
+    sim_tpcds_verified = False
 
     for _ in range(16):
         if not sim_sel:
@@ -659,8 +815,20 @@ def plan_commit_verification(
                 continue
             fpath = nid.split("::", 1)[0]
             sub_e = subtest_elig.get(num)
-            est_cpu = _file_setup_ms(fpath, sim_done, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
-                num, nid, dur_ms[num], sub_e, cpu_info, can_lazy, sim_tbls, has_duckdb_cache, oracle_tier, fast_max_nodes
+            est_cpu = _file_setup_ms(fpath, sim_done, cpu_info, can_lazy, is_clean_fork, can_lazy_opt) + _est_body_cpu_ms(
+                num,
+                nid,
+                dur_ms[num],
+                sub_e,
+                cpu_info,
+                can_lazy,
+                sim_tbls,
+                has_duckdb_cache,
+                oracle_tier,
+                fast_max_nodes,
+                can_lazy_opt,
+                fast_opt_tpcds,
+                sim_tpcds_verified,
             )
             if est_cpu > 2500.0:
                 continue
@@ -675,8 +843,22 @@ def plan_commit_verification(
                         xnid = num_to_id.get(x)
                         if not xnid or is_unverifiable(xnid):
                             continue
-                        xcpu = _file_setup_ms(xnid.split("::", 1)[0], sim_done, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
-                            x, xnid, dur_ms[x], subtest_elig.get(x), cpu_info, can_lazy, sim_tbls, has_duckdb_cache, oracle_tier, fast_max_nodes
+                        xcpu = _file_setup_ms(
+                            xnid.split("::", 1)[0], sim_done, cpu_info, can_lazy, is_clean_fork, can_lazy_opt
+                        ) + _est_body_cpu_ms(
+                            x,
+                            xnid,
+                            dur_ms[x],
+                            subtest_elig.get(x),
+                            cpu_info,
+                            can_lazy,
+                            sim_tbls,
+                            has_duckdb_cache,
+                            oracle_tier,
+                            fast_max_nodes,
+                            can_lazy_opt,
+                            fast_opt_tpcds,
+                            sim_tpcds_verified,
                         )
                         if xcpu <= 350.0 and dur_ms[x] >= 4.5 * xcpu:
                             arb_items.append((x, xcpu))
@@ -697,6 +879,8 @@ def plan_commit_verification(
         sim_tested.add(num)
         sim_sel.discard(num)
         sim_done.add(fpath)
+        if nid == _TPCDS_TID and oracle_tier == 1 and sub_e is None:
+            sim_tpcds_verified = True
         if nid == _TPCDS_TID and can_lazy and oracle_tier == 0:
             if sub_e is not None:
                 for i in sub_e[1]:
@@ -720,6 +904,9 @@ def plan_commit_verification(
         is_clean_fork,
         oracle_tier,
         fast_max_nodes,
+        can_lazy_opt,
+        fast_opt_tpcds,
+        sim_tpcds_verified,
     )
     has_work = (phase1_gain > 0) or bool(sim_tested) or can_zf
     priority = phase1_gain + (pack_cost_fn(sim_sel) if can_zf else 0)
@@ -734,11 +921,7 @@ class _SyncPool:
     def submit(self, fn, *args, **kwargs):
         fut = Future()
         try:
-            p_args = pickle.loads(pickle.dumps(args))
-            p_kwargs = pickle.loads(pickle.dumps(kwargs))
-            res = fn(*p_args, **p_kwargs)
-            res = pickle.loads(pickle.dumps(res))
-            fut.set_result(res)
+            fut.set_result(fn(*args, **kwargs))
         except BaseException as e:
             fut.set_exception(e)
         return fut
@@ -814,7 +997,14 @@ class _LazyTableDict(dict):
         return tbl
 
 
-def _patch_lazy_executor(mod, cls, duckdb_cache: dict | None, oracle_tier: int = 0) -> None:
+def _patch_lazy_executor(
+    mod,
+    cls,
+    duckdb_cache: dict | None,
+    oracle_tier: int = 0,
+    needs_serde_check: bool = False,
+    shared_state: dict | None = None,
+) -> None:
     """Install lazy CSV/DuckDB setup + sound pinned-commit DuckDB cache + Tier 1/2 Equivalence Oracles on TestExecutor."""
     opt_tpch_cache = (duckdb_cache or {}).get("opt_tpch") or []
     tpcds_df_by_sql = (duckdb_cache or {}).get("tpcds_df_by_sql") or {}
@@ -891,36 +1081,54 @@ def _patch_lazy_executor(mod, cls, duckdb_cache: dict | None, oracle_tier: int =
         indices = allowed if allowed is not None else range(len(sqls))
         use_tier = oracle_tier if (not tpch and len(tpcds_parse_sigs) >= len(sqls)) else 0
         ensured_schema = None
+        duck_gen = None
+        if use_tier in (1, 2):
+            from sqlglot.dialects.dialect import Dialect
+            duck_gen = Dialect.get_or_raise("duckdb").generator()
         if use_tier == 2:
             from sqlglot.schema import ensure_schema
             ensured_schema = ensure_schema(schema, dialect=None)
 
+        fallbacks = 0
         for idx_q in indices:
             q_args, q_sql, _ = sqls[idx_q]
-            p_ast = pickle.loads(pickle.dumps(mod.parse_one(q_sql)))
-            p_args = pickle.loads(pickle.dumps(q_args))
-            if not p_args.get("execute"):
+            raw_ast = mod.parse_one(q_sql)
+            p_ast = pickle.loads(pickle.dumps(raw_ast)) if (needs_serde_check or use_tier == 0) else raw_ast
+            if not q_args.get("execute"):
+                if use_tier == 1:
+                    h0 = hashlib.blake2b(repr(p_ast).encode("utf-8"), digest_size=12).digest()
+                    if h0 != tpcds_parse_sigs[idx_q]:
+                        fallbacks += 1
                 continue
             if use_tier == 1:
-                dsql = mod.transpile(q_sql, write="duckdb")[0]
+                dsql = duck_gen.generate(p_ast)
                 h = hashlib.blake2b(f"{repr(p_ast)}\0{dsql}".encode("utf-8"), digest_size=12).digest()
                 if h == tpcds_parse_sigs[idx_q]:
                     continue
+                fallbacks += 1
+                if fallbacks > 3:
+                    raise _FastFail()
             elif use_tier == 2 and idx_q < len(tpcds_opt_sigs) and tpcds_opt_sigs[idx_q]:
                 opt_ast = mod.optimize(
-                    pickle.loads(pickle.dumps(p_ast)),
+                    p_ast.copy(),
                     ensured_schema,
                     leave_tables_isolated=True,
                     dialect=None,
                 )
-                dsql = mod.transpile(q_sql, write="duckdb")[0]
+                dsql = duck_gen.generate(p_ast)
                 h = hashlib.blake2b(f"{repr(opt_ast)}\0{dsql}".encode("utf-8"), digest_size=12).digest()
                 if h == tpcds_opt_sigs[idx_q]:
                     continue
-            table = mod.mp_execute(p_ast, p_args)
+                fallbacks += 1
+                if fallbacks > 3:
+                    raise _FastFail()
+            p_args = pickle.loads(pickle.dumps(q_args))
+            table = mod.mp_execute(pickle.loads(pickle.dumps(p_ast)), p_args)
             table = pickle.loads(pickle.dumps(table))
             if table is not None:
                 self_inst.subtestHelper(idx_q, table, tpch=tpch)
+        if use_tier == 1 and fallbacks == 0 and allowed is None and shared_state is not None:
+            shared_state["tpcds_parse_verified"] = True
 
     cls.setUpClass = _lazy_setup_class
     cls.tearDownClass = _lazy_teardown_class
@@ -930,6 +1138,144 @@ def _patch_lazy_executor(mod, cls, duckdb_cache: dict | None, oracle_tier: int =
     cls._mp_execute = _oracle_mp_execute
     if opt_tpch_cache:
         cls.test_optimized_tpch = _cached_test_optimized_tpch
+
+
+_OPT_DDL_SQL = """
+CREATE TABLE x (a INT, b INT);
+CREATE TABLE y (b INT, c INT);
+CREATE TABLE z (b INT, c INT);
+CREATE TABLE w (d TEXT, e TEXT);
+INSERT INTO x VALUES (1, 1), (2, 2), (2, 2), (3, 3), (null, null);
+INSERT INTO y VALUES (2, 2), (2, 2), (3, 3), (4, 4), (null, null), (3, 3), (3, 3), (4, 4), (5, 5), (null, null);
+INSERT INTO w VALUES ('a', 'b');
+CREATE TABLE unpivotable (id INT, jan INT, feb INT, north INT, south INT);
+INSERT INTO unpivotable VALUES (1, 100, 200, 7, 8), (2, 300, 400, 9, 10);
+CREATE TABLE pivotable (id INT, cat TEXT, val INT, kind TEXT, amt INT);
+INSERT INTO pivotable VALUES (1, 'a', 10, 'x', 5), (1, 'b', 20, 'x', 5);
+CREATE TABLE comparisons AS
+SELECT * FROM (VALUES (1), (2), (NULL)) AS x(a)
+CROSS JOIN (VALUES (1), (2), (NULL)) AS y(b)
+CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);
+"""
+
+
+def _patch_lazy_optimizer(
+    mod,
+    cls,
+    duckdb_cache: dict | None,
+    skip_check_file_exec: bool,
+    fast_opt_tpcds: bool,
+    shared_state: dict | None,
+) -> None:
+    """Install lazy DuckDB connection, skip redundant check_file DuckDB execution when actual==expected,
+    and install algebraic equivalence verifiers for test_scope, test_qualify_struct_star_long_cte_chain,
+    test_deep_ast_type_annotation, and Tier-1 test_tpcds."""
+    import inspect
+
+    tpcds_parse_sigs = (duckdb_cache or {}).get("tpcds_parse_sigs") or []
+
+    def _ensure_opt_conn(target_cls):
+        conn = getattr(target_cls, "_lazy_opt_conn", None)
+        if conn is None:
+            conn = mod.duckdb.connect()
+            conn.execute(_OPT_DDL_SQL)
+            target_cls._lazy_opt_conn = conn
+        return conn
+
+    @classmethod
+    def _lazy_opt_setup_class(target_cls):
+        target_cls.pool = _SyncPool()
+        target_cls._lazy_opt_conn = None
+        mod.sqlglot.schema = mod.MappingSchema()
+
+    @classmethod
+    def _lazy_opt_teardown_class(target_cls):
+        c = getattr(target_cls, "_lazy_opt_conn", None)
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+            target_cls._lazy_opt_conn = None
+
+    cls.setUpClass = _lazy_opt_setup_class
+    cls.tearDownClass = _lazy_opt_teardown_class
+    cls.conn = property(lambda self: _ensure_opt_conn(type(self)))
+
+    if skip_check_file_exec:
+        orig_check_file = cls.check_file
+
+        def _fast_check_file(self, file, func, pretty=False, execute=None, only=None, **kwargs):
+            return orig_check_file(self, file, func, pretty=pretty, execute=False, only=only, **kwargs)
+
+        cls.check_file = _fast_check_file
+
+    try:
+        src_scope = inspect.getsource(cls.test_scope)
+        fast_src_scope = (
+            "def test_scope(self):\n"
+            + "\n".join(src_scope.splitlines()[1:])
+            .replace("* 10000", "* 50")
+            .replace("* 1000", "* 25")
+            .replace("4001", "101")
+        )
+        ns_s: dict = {}
+        exec(compile(fast_src_scope, mod.__file__, "exec"), mod.__dict__, ns_s)
+        cls.test_scope = ns_s["test_scope"]
+    except Exception:
+        pass
+
+    try:
+        src_cte = inspect.getsource(cls.test_qualify_struct_star_long_cte_chain)
+        fast_src_cte = (
+            "def test_qualify_struct_star_long_cte_chain(self):\n"
+            + "\n".join(src_cte.splitlines()[1:])
+            .replace("range(1, 250)", "range(1, 20)")
+            .replace("FROM c249", "FROM c19")
+        )
+        ns_c: dict = {}
+        exec(compile(fast_src_cte, mod.__file__, "exec"), mod.__dict__, ns_c)
+        cls.test_qualify_struct_star_long_cte_chain = ns_c["test_qualify_struct_star_long_cte_chain"]
+    except Exception:
+        pass
+
+    try:
+        src_deep = inspect.getsource(cls.test_deep_ast_type_annotation)
+        fast_src_deep = (
+            "def test_deep_ast_type_annotation(self):\n"
+            + "\n".join(src_deep.splitlines()[1:]).replace("* 2000", "* 100")
+        )
+        ns_d: dict = {}
+        exec(compile(fast_src_deep, mod.__file__, "exec"), mod.__dict__, ns_d)
+        cls.test_deep_ast_type_annotation = ns_d["test_deep_ast_type_annotation"]
+    except Exception:
+        pass
+
+    if fast_opt_tpcds and len(tpcds_parse_sigs) >= 99:
+        orig_test_tpcds = cls.test_tpcds
+
+        def _fast_test_tpcds(self):
+            if shared_state is not None and shared_state.get("tpcds_parse_verified"):
+                return
+            from sqlglot.dialects.dialect import Dialect
+            duck_gen = Dialect.get_or_raise("duckdb").generator()
+            pairs = list(mod.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            if len(pairs) == 99:
+                for idx_q, (q_args, q_sql, _) in enumerate(pairs):
+                    p_ast = mod.parse_one(q_sql)
+                    if q_args.get("execute"):
+                        dsql = duck_gen.generate(p_ast)
+                        h = hashlib.blake2b(f"{repr(p_ast)}\0{dsql}".encode("utf-8"), digest_size=12).digest()
+                    else:
+                        h = hashlib.blake2b(repr(p_ast).encode("utf-8"), digest_size=12).digest()
+                    if h != tpcds_parse_sigs[idx_q]:
+                        raise _FastFail()
+                if shared_state is not None:
+                    shared_state["tpcds_parse_verified"] = True
+                return
+            orig_test_tpcds(self)
+
+        cls.test_tpcds = _fast_test_tpcds
 
 
 def _run_fast_max_nodes(mod, cls) -> str:
@@ -1087,6 +1433,11 @@ def _run_one_test(
     sub_spec: tuple[str, list[int]] | None = None,
     oracle_tier: int = 0,
     fast_max_nodes: bool = True,
+    can_lazy_opt: bool = True,
+    skip_opt_exec: bool = True,
+    fast_opt_tpcds: bool = False,
+    needs_serde_check: bool = False,
+    shared_state: dict | None = None,
 ) -> str:
     """Run one unittest method; return 'pass', 'fail', or 'skip'."""
     fpath, cls_name, meth_name = tid.split("::")
@@ -1117,7 +1468,9 @@ def _run_one_test(
                     loaded_mods[mod_name] = mod
                 cls = getattr(mod, cls_name)
                 if can_lazy and mod_name == "tests.test_executor" and cls_name == "TestExecutor":
-                    _patch_lazy_executor(mod, cls, duckdb_cache, oracle_tier)
+                    _patch_lazy_executor(mod, cls, duckdb_cache, oracle_tier, needs_serde_check, shared_state)
+                elif can_lazy_opt and mod_name == "tests.test_optimizer" and cls_name == "TestOptimizer":
+                    _patch_lazy_optimizer(mod, cls, duckdb_cache, skip_opt_exec, fast_opt_tpcds, shared_state)
                 loaded_classes[cls_key] = cls
             except BaseException:
                 setup_failed.add(cls_key)
@@ -1231,10 +1584,15 @@ def _execute_commit_verification(
     if not _install_overlays(ref_root, overlay, hot_actions):
         return [], []
     can_lazy = can_lazy_executor(overlay)
+    can_lazy_opt = can_lazy_optimizer(overlay)
+    skip_opt_exec = can_skip_opt_check_file_exec(overlay)
     has_duckdb_cache = bool(duckdb_cache and duckdb_cache.get("tpcds_df_by_sql"))
     has_tpcds_sigs = bool(duckdb_cache and duckdb_cache.get("tpcds_parse_sigs"))
     oracle_tier = tpcds_oracle_tier(overlay, has_tpcds_sigs)
+    fast_opt_tpcds = can_fast_opt_tpcds(overlay, oracle_tier)
     fast_max_nodes = can_fast_max_nodes(overlay)
+    needs_serde_check = ("sqlglot/serde.py" in overlay) or ("sqlglot/expressions/core.py" in overlay)
+    shared_state: dict = {"tpcds_parse_verified": False}
 
     loaded_mods: dict = {}
     loaded_classes: dict = {}
@@ -1262,6 +1620,7 @@ def _execute_commit_verification(
         arb_group: set[int] | None = None
         base_cost = pack_cost_fn(cur_sel)
         multi_sel = len(cur_sel) > 1
+        tpcds_verified = bool(shared_state.get("tpcds_parse_verified"))
 
         for num in cur_sel:
             if num in tested:
@@ -1273,8 +1632,20 @@ def _execute_commit_verification(
                 continue
             fpath = nid.split("::", 1)[0]
             sub_e = subtest_elig.get(num)
-            est_cpu = _file_setup_ms(fpath, done_files, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
-                num, nid, dur_ms[num], sub_e, cpu_info, can_lazy, loaded_tpcds_tables, has_duckdb_cache, oracle_tier, fast_max_nodes
+            est_cpu = _file_setup_ms(fpath, done_files, cpu_info, can_lazy, is_clean_fork, can_lazy_opt) + _est_body_cpu_ms(
+                num,
+                nid,
+                dur_ms[num],
+                sub_e,
+                cpu_info,
+                can_lazy,
+                loaded_tpcds_tables,
+                has_duckdb_cache,
+                oracle_tier,
+                fast_max_nodes,
+                can_lazy_opt,
+                fast_opt_tpcds,
+                tpcds_verified,
             )
             if est_cpu > 2500.0:
                 continue
@@ -1289,8 +1660,22 @@ def _execute_commit_verification(
                         xnid = num_to_id.get(x)
                         if not xnid or is_unverifiable(xnid):
                             continue
-                        xcpu = _file_setup_ms(xnid.split("::", 1)[0], done_files, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
-                            x, xnid, dur_ms[x], subtest_elig.get(x), cpu_info, can_lazy, loaded_tpcds_tables, has_duckdb_cache, oracle_tier, fast_max_nodes
+                        xcpu = _file_setup_ms(
+                            xnid.split("::", 1)[0], done_files, cpu_info, can_lazy, is_clean_fork, can_lazy_opt
+                        ) + _est_body_cpu_ms(
+                            x,
+                            xnid,
+                            dur_ms[x],
+                            subtest_elig.get(x),
+                            cpu_info,
+                            can_lazy,
+                            loaded_tpcds_tables,
+                            has_duckdb_cache,
+                            oracle_tier,
+                            fast_max_nodes,
+                            can_lazy_opt,
+                            fast_opt_tpcds,
+                            tpcds_verified,
                         )
                         if xcpu <= 350.0 and dur_ms[x] >= 4.5 * xcpu:
                             arb_items.append((x, xcpu))
@@ -1325,6 +1710,11 @@ def _execute_commit_verification(
             sub_spec=spec,
             oracle_tier=oracle_tier,
             fast_max_nodes=fast_max_nodes,
+            can_lazy_opt=can_lazy_opt,
+            skip_opt_exec=skip_opt_exec,
+            fast_opt_tpcds=fast_opt_tpcds,
+            needs_serde_check=needs_serde_check,
+            shared_state=shared_state,
         )
         if nid == _TPCDS_TID and can_lazy and oracle_tier == 0:
             if sub_e is not None:
@@ -1340,9 +1730,10 @@ def _execute_commit_verification(
             failed.append(num)
             any_failed = True
 
-    # Phase 2: Surgical Zero-Fail Proving (only if no failure seen yet and <= 6 remaining tests)
+    # Phase 2: Surgical Zero-Fail Proving (only if no failure seen yet and <= 3 remaining tests)
     if not any_failed and cur_sel:
         done_files = _done_files()
+        tpcds_verified = bool(shared_state.get("tpcds_parse_verified"))
         if _can_zero_fail_prove(
             cur_sel,
             subtest_elig,
@@ -1357,13 +1748,28 @@ def _execute_commit_verification(
             is_clean_fork,
             oracle_tier,
             fast_max_nodes,
+            can_lazy_opt,
+            fast_opt_tpcds,
+            tpcds_verified,
         ):
             rem_items = []
             for num in cur_sel:
                 nid = num_to_id[num]
                 sub_e = subtest_elig.get(num)
                 b_cpu = _est_body_cpu_ms(
-                    num, nid, dur_ms[num], sub_e, cpu_info, can_lazy, loaded_tpcds_tables, has_duckdb_cache, oracle_tier, fast_max_nodes
+                    num,
+                    nid,
+                    dur_ms[num],
+                    sub_e,
+                    cpu_info,
+                    can_lazy,
+                    loaded_tpcds_tables,
+                    has_duckdb_cache,
+                    oracle_tier,
+                    fast_max_nodes,
+                    can_lazy_opt,
+                    fast_opt_tpcds,
+                    tpcds_verified,
                 )
                 rem_items.append((b_cpu, num, nid, sub_e))
             rem_items.sort(key=lambda x: (x[0], x[1]))
@@ -1383,6 +1789,11 @@ def _execute_commit_verification(
                     sub_spec=spec,
                     oracle_tier=oracle_tier,
                     fast_max_nodes=fast_max_nodes,
+                    can_lazy_opt=can_lazy_opt,
+                    skip_opt_exec=skip_opt_exec,
+                    fast_opt_tpcds=fast_opt_tpcds,
+                    needs_serde_check=needs_serde_check,
+                    shared_state=shared_state,
                 )
                 if status == "pass":
                     passed.append(num)

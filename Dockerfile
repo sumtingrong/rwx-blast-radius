@@ -1,6 +1,7 @@
 # Multi-stage build: build per-test coverage & AST maps in builder using exact pinned Python 3.13 + requirements.lock,
 # then copy only runtime selector + split pickle maps + pinned sqlglot/tests source into final slim image.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 
 WORKDIR /build
 COPY requirements.lock /build/requirements.lock
@@ -16,7 +17,7 @@ COPY build_maps.py /build/build_maps.py
 RUN mkdir -p /build/out && python /build/build_maps.py /build/sqlglot_ref /build/out/maps.pkl
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /build/out /app/

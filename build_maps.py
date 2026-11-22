@@ -381,11 +381,7 @@ class _SyncPool:
     def submit(self, fn, *args, **kwargs):
         fut = Future()
         try:
-            p_args = pickle.loads(pickle.dumps(args))
-            p_kwargs = pickle.loads(pickle.dumps(kwargs))
-            res = fn(*p_args, **p_kwargs)
-            res = pickle.loads(pickle.dumps(res))
-            fut.set_result(res)
+            fut.set_result(fn(*args, **kwargs))
         except Exception as e:
             fut.set_exception(e)
         return fut
@@ -1738,13 +1734,13 @@ def _build_runtime_caches_worker(args):
         te.initializer(TPCDS_SCHEMA, tpcds_tables)
         ds_sub_ms: list[int] = []
         for idx_q, (meta, sql, _) in enumerate(tpcds_sqls):
-            p_ast_check = pickle.loads(pickle.dumps(parse_one(sql)))
+            p_ast_check = parse_one(sql)
             if meta.get("execute"):
                 dsql = transpile(sql, write="duckdb")[0]
                 df = tpcds_conn.execute(dsql).fetchdf()
                 tpcds_df_by_sql[sql] = (dsql, df)
                 opt_ast_check = optimize(
-                    pickle.loads(pickle.dumps(p_ast_check)),
+                    p_ast_check.copy(),
                     tpcds_schema_ensured,
                     leave_tables_isolated=True,
                     dialect=None,
@@ -1755,8 +1751,7 @@ def _build_runtime_caches_worker(args):
                 tpcds_opt_sigs.append(
                     hashlib.blake2b(f"{repr(opt_ast_check)}\0{dsql}".encode("utf-8"), digest_size=12).digest()
                 )
-                ast_q = parse_one(sql)
-                tpcds_tables_by_idx[idx_q] = sorted({t.name for t in find_tables(ast_q)})
+                tpcds_tables_by_idx[idx_q] = sorted({t.name for t in find_tables(p_ast_check)})
                 tq0 = time.process_time()
                 p_ast = pickle.loads(pickle.dumps(parse_one(sql)))
                 p_args = pickle.loads(pickle.dumps(meta))

@@ -2177,6 +2177,8 @@ def main() -> None:
             can_lazy = verifier.can_lazy_executor(overlay)
             oracle_tier = verifier.tpcds_oracle_tier(overlay, has_cache_file)
             fast_max_nodes = verifier.can_fast_max_nodes(overlay)
+            can_lazy_opt = verifier.can_lazy_optimizer(overlay)
+            fast_opt_tpcds = verifier.can_fast_opt_tpcds(overlay, oracle_tier)
             subtest_elig, has_work, priority = verifier.plan_commit_verification(
                 sel,
                 touch_info,
@@ -2190,6 +2192,8 @@ def main() -> None:
                 is_clean_fork,
                 oracle_tier,
                 fast_max_nodes,
+                can_lazy_opt,
+                fast_opt_tpcds,
             )
             if not has_work:
                 continue
@@ -2225,7 +2229,7 @@ def main() -> None:
                     import duckdb  # noqa: F401
             except BaseException:
                 do_preimport = False
-            if do_preimport and exec_job_cnt >= 1 and has_cache_file:
+            if do_preimport and (exec_job_cnt >= 1 or opt_job_cnt >= 1) and has_cache_file:
                 try:
                     with open(cache_path, "rb") as dcf:
                         duckdb_cache = pickle.load(dcf)
@@ -2260,6 +2264,8 @@ def main() -> None:
                 can_lazy = verifier.can_lazy_executor(overlay)
                 oracle_tier = verifier.tpcds_oracle_tier(overlay, has_tpcds_sigs)
                 fast_max_nodes = verifier.can_fast_max_nodes(overlay)
+                can_lazy_opt = verifier.can_lazy_optimizer(overlay)
+                fast_opt_tpcds = verifier.can_fast_opt_tpcds(overlay, oracle_tier)
                 subtest_elig, has_work, priority = verifier.plan_commit_verification(
                     sel,
                     touch_info,
@@ -2273,6 +2279,8 @@ def main() -> None:
                     is_clean_fork,
                     oracle_tier,
                     fast_max_nodes,
+                    can_lazy_opt,
+                    fast_opt_tpcds,
                 )
                 if not has_work:
                     continue

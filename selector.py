@@ -599,7 +599,16 @@ def analyze_diff_asts(
     extra_anchors: list[int] = []
     allow_bool_builtin = not (_is_bool_shadowed(old_tree) or _is_bool_shadowed(new_tree))
 
-    def walk_cmp(o: ast.AST, n: ast.AST, cls_stack: list[str], in_func: bool, bool_ctx: bool) -> bool:
+    def walk_cmp(
+        o: ast.AST,
+        n: ast.AST,
+        cls_stack: list[str],
+        in_func: bool,
+        bool_ctx: bool,
+        cur_span: tuple[int, int] | None = None,
+    ) -> bool:
+        if hasattr(o, "lineno"):
+            cur_span = (o.lineno, getattr(o, "end_lineno", None) or o.lineno)
         # 1. Pure boolean negation / operator inversion (symmetric, 0 tests)
         if _unwrap_not_cmp_invert(o, n) or _unwrap_not_cmp_invert(n, o):
             return True
@@ -617,38 +626,38 @@ def analyze_diff_asts(
         # 2b. Pure bool_ctx & ternary equivalences (0 tests)
         if bool_ctx:
             dn_o = _is_double_not(o)
-            if dn_o is not None and walk_cmp(dn_o, n, cls_stack, in_func, True):
+            if dn_o is not None and walk_cmp(dn_o, n, cls_stack, in_func, True, cur_span):
                 return True
             dn_n = _is_double_not(n)
-            if dn_n is not None and walk_cmp(o, dn_n, cls_stack, in_func, True):
+            if dn_n is not None and walk_cmp(o, dn_n, cls_stack, in_func, True, cur_span):
                 return True
             if allow_bool_builtin:
                 bc_o = _is_bool_call(o)
-                if bc_o is not None and walk_cmp(bc_o, n, cls_stack, in_func, True):
+                if bc_o is not None and walk_cmp(bc_o, n, cls_stack, in_func, True, cur_span):
                     return True
                 bc_n = _is_bool_call(n)
-                if bc_n is not None and walk_cmp(o, bc_n, cls_stack, in_func, True):
+                if bc_n is not None and walk_cmp(o, bc_n, cls_stack, in_func, True, cur_span):
                     return True
         if allow_bool_builtin:
             if isinstance(o, ast.IfExp) and isinstance(o.body, ast.Constant) and isinstance(o.orelse, ast.Constant):
                 if o.body.value is True and o.orelse.value is False:
                     bc_n = _is_bool_call(n)
-                    if bc_n is not None and walk_cmp(o.test, bc_n, cls_stack, in_func, True):
+                    if bc_n is not None and walk_cmp(o.test, bc_n, cls_stack, in_func, True, cur_span):
                         return True
-                    if bool_ctx and walk_cmp(o.test, n, cls_stack, in_func, True):
+                    if bool_ctx and walk_cmp(o.test, n, cls_stack, in_func, True, cur_span):
                         return True
                 elif o.body.value is False and o.orelse.value is True:
-                    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not) and walk_cmp(o.test, n.operand, cls_stack, in_func, True):
+                    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not) and walk_cmp(o.test, n.operand, cls_stack, in_func, True, cur_span):
                         return True
             if isinstance(n, ast.IfExp) and isinstance(n.body, ast.Constant) and isinstance(n.orelse, ast.Constant):
                 if n.body.value is True and n.orelse.value is False:
                     bc_o = _is_bool_call(o)
-                    if bc_o is not None and walk_cmp(bc_o, n.test, cls_stack, in_func, True):
+                    if bc_o is not None and walk_cmp(bc_o, n.test, cls_stack, in_func, True, cur_span):
                         return True
-                    if bool_ctx and walk_cmp(o, n.test, cls_stack, in_func, True):
+                    if bool_ctx and walk_cmp(o, n.test, cls_stack, in_func, True, cur_span):
                         return True
                 elif n.body.value is False and n.orelse.value is True:
-                    if isinstance(o, ast.UnaryOp) and isinstance(o.op, ast.Not) and walk_cmp(o.operand, n.test, cls_stack, in_func, True):
+                    if isinstance(o, ast.UnaryOp) and isinstance(o.op, ast.Not) and walk_cmp(o.operand, n.test, cls_stack, in_func, True, cur_span):
                         return True
 
         if collect_runtime_swaps:
@@ -679,14 +688,14 @@ def analyze_diff_asts(
         if ignore_annotations and in_func:
             if isinstance(o, ast.AnnAssign) and isinstance(n, ast.Assign) and o.value is not None and len(n.targets) == 1:
                 if ast_equal(o.target, n.targets[0]):
-                    return walk_cmp(o.value, n.value, cls_stack, True, False)
+                    return walk_cmp(o.value, n.value, cls_stack, True, False, cur_span)
             if isinstance(o, ast.Assign) and isinstance(n, ast.AnnAssign) and n.value is not None and len(o.targets) == 1:
                 if ast_equal(o.targets[0], n.target):
-                    return walk_cmp(o.value, n.value, cls_stack, True, False)
+                    return walk_cmp(o.value, n.value, cls_stack, True, False, cur_span)
 
         if type(o) is not type(n):
-            if in_func and hasattr(o, "lineno"):
-                other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+            if in_func and cur_span is not None:
+                other_spans.append(cur_span)
                 return True
             return False
 
@@ -748,7 +757,7 @@ def analyze_diff_asts(
             if len(ob) != len(nb):
                 return False
             for oi, ni in zip(ob, nb):
-                if not walk_cmp(oi, ni, cls_stack, False, False):
+                if not walk_cmp(oi, ni, cls_stack, False, False, cur_span):
                     return False
             return True
 
@@ -765,7 +774,7 @@ def analyze_diff_asts(
                 return False
             cls_stack.append(o.name)
             for ob, nb in zip(obody, nbody):
-                if not walk_cmp(ob, nb, cls_stack, False, False):
+                if not walk_cmp(ob, nb, cls_stack, False, False, cur_span):
                     cls_stack.pop()
                     return False
             cls_stack.pop()
@@ -795,7 +804,7 @@ def analyze_diff_asts(
                     if changed_keys:
                         dict_diffs.append((".".join(cls_stack), target_id, o.lineno, o.end_lineno or o.lineno, changed_keys))
                     for ob, nb in lambda_pairs:
-                        if not walk_cmp(ob, nb, cls_stack, True, False):
+                        if not walk_cmp(ob, nb, cls_stack, True, False, cur_span):
                             return False
                     return True
                 other_spans.append((o.lineno, o.end_lineno or o.lineno))
@@ -896,30 +905,30 @@ def analyze_diff_asts(
                                     added_anchor = True
                             if added_anchor:
                                 continue
-                    elif in_func and hasattr(o, "lineno"):
-                        other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                    elif in_func and cur_span is not None:
+                        other_spans.append(cur_span)
                         continue
                     return False
                 for oi, ni in zip(ov, nv):
                     if isinstance(oi, ast.AST) and isinstance(ni, ast.AST):
-                        if not walk_cmp(oi, ni, cls_stack, child_in_func, child_bool):
+                        if not walk_cmp(oi, ni, cls_stack, child_in_func, child_bool, cur_span):
                             return False
                     elif oi != ni:
-                        if hasattr(o, "lineno"):
-                            other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                        if cur_span is not None:
+                            other_spans.append(cur_span)
                             return True
                         return False
             elif isinstance(ov, ast.AST) and isinstance(nv, ast.AST):
-                if not walk_cmp(ov, nv, cls_stack, child_in_func, child_bool):
+                if not walk_cmp(ov, nv, cls_stack, child_in_func, child_bool, cur_span):
                     return False
             elif ov != nv:
-                if hasattr(o, "lineno"):
-                    other_spans.append((o.lineno, getattr(o, "end_lineno", None) or o.lineno))
+                if cur_span is not None:
+                    other_spans.append(cur_span)
                     return True
                 return False
         return True
 
-    ok = walk_cmp(old_tree, new_tree, [], False, False)
+    ok = walk_cmp(old_tree, new_tree, [], False, False, None)
     return cmp_swaps, falsy_swaps, dict_diffs, other_spans, extra_anchors, not ok
 
 

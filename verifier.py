@@ -84,7 +84,6 @@ _NO_HOTPATCH_CORE_RELS = frozenset({
     "sqlglot/dialects/__init__.py",
     "sqlglot/expressions/__init__.py",
     "sqlglot/optimizer/__init__.py",
-    "sqlglot/parser.py",
     "sqlglot/parsers/__init__.py",
     "sqlglot/typing/__init__.py",
 })
@@ -233,6 +232,14 @@ def build_hot_patch_plan(
         if len(ob) != len(nb):
             return None
         exported = set(imported_from_file.get(rel, ()))
+        cls_func_refs: set[str] = set()
+        for s_node in ob:
+            if isinstance(s_node, ast.ClassDef):
+                for cm in s_node.body:
+                    if not isinstance(cm, ast.FunctionDef):
+                        for sub_n in ast.walk(cm):
+                            if isinstance(sub_n, ast.Name):
+                                cls_func_refs.add(sub_n.id)
         mod_name = rel[:-12].replace("/", ".") if rel.endswith("/__init__.py") else rel[:-3].replace("/", ".")
         fpath_str = str(p.resolve())
 
@@ -244,6 +251,7 @@ def build_hot_patch_plan(
                     os_node.name != ns_node.name
                     or os_node.name in _ONCE_FUNCS
                     or os_node.name in exported
+                    or os_node.name in cls_func_refs
                     or os_node.decorator_list
                     or ns_node.decorator_list
                 ):
@@ -515,6 +523,8 @@ def _est_body_cpu_ms(
 
     if nid == _TPCDS_TID and oracle_tier in (1, 2):
         n_q = len(sub_entry[1]) if sub_entry is not None else 99
+        if oracle_tier == 2 and n_q > 35:
+            return 9999.0
         per_q = 7.5 if oracle_tier == 1 else 45.0
         return max(15.0, n_q * per_q)
 
@@ -567,8 +577,9 @@ def _can_zero_fail_prove(
     oracle_tier: int = 0,
     fast_max_nodes: bool = True,
 ) -> bool:
-    """Surgical Phase 2 Zero-Fail Proving: restricted to <= 6 tests and <= 1.2s CPU."""
-    if not cur_sel or len(cur_sel) > 6:
+    """Surgical Phase 2 Zero-Fail Proving: restricted to <= 3 warm tests (or 1 clean test) and <= 350ms CPU."""
+    max_tests = 1 if is_clean_fork else 3
+    if not cur_sel or len(cur_sel) > max_tests:
         return False
     cur_cost = pack_cost_fn(cur_sel)
     if cur_cost <= 0:
@@ -599,9 +610,9 @@ def _can_zero_fail_prove(
         tot_cpu += setup + body
         if body > max_single:
             max_single = body
-        if max_single > 900.0 or tot_cpu > 1200.0:
+        if max_single > 300.0 or tot_cpu > 350.0:
             return False
-    return tot_cpu <= min(1200.0, 0.42 * cur_cost)
+    return tot_cpu <= min(350.0, 0.16 * cur_cost)
 
 
 def plan_commit_verification(
@@ -631,11 +642,17 @@ def plan_commit_verification(
     phase1_gain = 0
 
     for _ in range(16):
+        if not sim_sel:
+            break
         best_choice = None
         best_roi = 0.0
         arb_group: set[int] | None = None
+        base_cost = pack_cost_fn(sim_sel)
+        multi_sel = len(sim_sel) > 1
         for num in sim_sel:
             if num in sim_tested:
+                continue
+            if multi_sel and dur_ms[num] < 250:
                 continue
             nid = num_to_id.get(num, "")
             if not nid or is_unverifiable(nid):
@@ -645,15 +662,15 @@ def plan_commit_verification(
             est_cpu = _file_setup_ms(fpath, sim_done, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
                 num, nid, dur_ms[num], sub_e, cpu_info, can_lazy, sim_tbls, has_duckdb_cache, oracle_tier, fast_max_nodes
             )
-            if est_cpu > 5500.0:
+            if est_cpu > 2500.0:
                 continue
-            delta_w = pack_cost_fn(sim_sel) - pack_cost_fn(sim_sel - {num})
+            delta_w = base_cost - pack_cost_fn(sim_sel - {num})
             eff_delta = delta_w
-            if eff_delta <= 0 and est_cpu <= 500.0 and dur_ms[num] >= 500 and dur_ms[num] >= 3.5 * est_cpu:
+            if eff_delta <= 0 and est_cpu <= 350.0 and dur_ms[num] >= 600 and dur_ms[num] >= 4.5 * est_cpu:
                 if arb_group is None:
                     arb_items = []
                     for x in sim_sel:
-                        if x in sim_tested or dur_ms[x] < 500:
+                        if x in sim_tested or dur_ms[x] < 600:
                             continue
                         xnid = num_to_id.get(x)
                         if not xnid or is_unverifiable(xnid):
@@ -661,15 +678,15 @@ def plan_commit_verification(
                         xcpu = _file_setup_ms(xnid.split("::", 1)[0], sim_done, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
                             x, xnid, dur_ms[x], subtest_elig.get(x), cpu_info, can_lazy, sim_tbls, has_duckdb_cache, oracle_tier, fast_max_nodes
                         )
-                        if xcpu <= 500.0 and dur_ms[x] >= 3.5 * xcpu:
+                        if xcpu <= 350.0 and dur_ms[x] >= 4.5 * xcpu:
                             arb_items.append((x, xcpu))
                     arb_set = {x for x, _ in arb_items}
-                    g_delta = (pack_cost_fn(sim_sel) - pack_cost_fn(sim_sel - arb_set)) if arb_set else 0
+                    g_delta = (base_cost - pack_cost_fn(sim_sel - arb_set)) if arb_set else 0
                     g_cpu = sum(c for _, c in arb_items)
-                    arb_group = arb_set if (g_delta > 0 and g_cpu <= 0.35 * g_delta) else set()
+                    arb_group = arb_set if (g_delta >= 350 and g_cpu <= 0.22 * g_delta) else set()
                 if num in arb_group:
                     eff_delta = dur_ms[num]
-            if eff_delta > 0 and est_cpu <= 0.34 * eff_delta:
+            if eff_delta >= 350 and est_cpu <= 0.22 * eff_delta:
                 roi = eff_delta / max(10.0, est_cpu)
                 if roi > best_roi:
                     best_roi = roi
@@ -1237,13 +1254,19 @@ def _execute_commit_verification(
 
     # Phase 1: Dynamic highest-ROI pruning (with TPC-DS Tier 1/2 equivalence oracle + fast test_max_nodes + arbitrage)
     for _ in range(32):
+        if not cur_sel:
+            break
         done_files = _done_files()
         best_choice = None
         best_roi = 0.0
         arb_group: set[int] | None = None
+        base_cost = pack_cost_fn(cur_sel)
+        multi_sel = len(cur_sel) > 1
 
         for num in cur_sel:
             if num in tested:
+                continue
+            if multi_sel and dur_ms[num] < 250:
                 continue
             nid = num_to_id.get(num, "")
             if not nid or is_unverifiable(nid):
@@ -1253,15 +1276,15 @@ def _execute_commit_verification(
             est_cpu = _file_setup_ms(fpath, done_files, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
                 num, nid, dur_ms[num], sub_e, cpu_info, can_lazy, loaded_tpcds_tables, has_duckdb_cache, oracle_tier, fast_max_nodes
             )
-            if est_cpu > 5500.0:
+            if est_cpu > 2500.0:
                 continue
-            delta_w = pack_cost_fn(cur_sel) - pack_cost_fn(cur_sel - {num})
+            delta_w = base_cost - pack_cost_fn(cur_sel - {num})
             eff_delta = delta_w
-            if eff_delta <= 0 and est_cpu <= 500.0 and dur_ms[num] >= 500 and dur_ms[num] >= 3.5 * est_cpu:
+            if eff_delta <= 0 and est_cpu <= 350.0 and dur_ms[num] >= 600 and dur_ms[num] >= 4.5 * est_cpu:
                 if arb_group is None:
                     arb_items = []
                     for x in cur_sel:
-                        if x in tested or dur_ms[x] < 500:
+                        if x in tested or dur_ms[x] < 600:
                             continue
                         xnid = num_to_id.get(x)
                         if not xnid or is_unverifiable(xnid):
@@ -1269,15 +1292,15 @@ def _execute_commit_verification(
                         xcpu = _file_setup_ms(xnid.split("::", 1)[0], done_files, cpu_info, can_lazy, is_clean_fork) + _est_body_cpu_ms(
                             x, xnid, dur_ms[x], subtest_elig.get(x), cpu_info, can_lazy, loaded_tpcds_tables, has_duckdb_cache, oracle_tier, fast_max_nodes
                         )
-                        if xcpu <= 500.0 and dur_ms[x] >= 3.5 * xcpu:
+                        if xcpu <= 350.0 and dur_ms[x] >= 4.5 * xcpu:
                             arb_items.append((x, xcpu))
                     arb_set = {x for x, _ in arb_items}
-                    g_delta = (pack_cost_fn(cur_sel) - pack_cost_fn(cur_sel - arb_set)) if arb_set else 0
+                    g_delta = (base_cost - pack_cost_fn(cur_sel - arb_set)) if arb_set else 0
                     g_cpu = sum(c for _, c in arb_items)
-                    arb_group = arb_set if (g_delta > 0 and g_cpu <= 0.35 * g_delta) else set()
+                    arb_group = arb_set if (g_delta >= 350 and g_cpu <= 0.22 * g_delta) else set()
                 if num in arb_group:
                     eff_delta = dur_ms[num]
-            if eff_delta > 0 and est_cpu <= 0.34 * eff_delta:
+            if eff_delta >= 350 and est_cpu <= 0.22 * eff_delta:
                 roi = eff_delta / max(10.0, est_cpu)
                 if roi > best_roi:
                     best_roi = roi

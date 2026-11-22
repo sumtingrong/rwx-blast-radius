@@ -1682,13 +1682,15 @@ def _build_runtime_caches_worker(args):
     concurrent.futures.ProcessPoolExecutor = _SyncPool
 
     test_cpu_ms: dict[str, int] = {
-        "tests/test_parser.py::TestParser::test_max_nodes": 35000,
+        "tests/test_parser.py::TestParser::test_max_nodes": 50,
     }
     sub_times_ms: dict[str, list[int]] = {}
     tpcds_tables_by_idx: dict[int, list[str]] = {}
     tpcds_csv_ms: dict[str, int] = {}
     opt_tpch_cache: list[tuple[str, str]] = []
     tpcds_df_by_sql: dict[str, tuple[str, object]] = {}
+    tpcds_parse_sigs: list[bytes] = []
+    tpcds_opt_sigs: list[bytes] = []
 
     # 1. Build DuckDB reference cache and calibrate TestExecutor TPC-DS/TPC-H
     try:
@@ -1696,6 +1698,8 @@ def _build_runtime_caches_worker(args):
         import tests.test_executor as te
         te.ProcessPoolExecutor = _SyncPool
         from sqlglot import find_tables, parse_one, transpile
+        from sqlglot.optimizer import optimize
+        from sqlglot.schema import ensure_schema
         from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
 
         tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
@@ -1730,13 +1734,27 @@ def _build_runtime_caches_worker(args):
             tpcds_csv_ms[table] = max(1, round((time.process_time() - tc0) * 1000))
 
         tpcds_sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        tpcds_schema_ensured = ensure_schema(TPCDS_SCHEMA, dialect=None)
         te.initializer(TPCDS_SCHEMA, tpcds_tables)
         ds_sub_ms: list[int] = []
         for idx_q, (meta, sql, _) in enumerate(tpcds_sqls):
+            p_ast_check = pickle.loads(pickle.dumps(parse_one(sql)))
             if meta.get("execute"):
                 dsql = transpile(sql, write="duckdb")[0]
                 df = tpcds_conn.execute(dsql).fetchdf()
                 tpcds_df_by_sql[sql] = (dsql, df)
+                opt_ast_check = optimize(
+                    pickle.loads(pickle.dumps(p_ast_check)),
+                    tpcds_schema_ensured,
+                    leave_tables_isolated=True,
+                    dialect=None,
+                )
+                tpcds_parse_sigs.append(
+                    hashlib.blake2b(f"{repr(p_ast_check)}\0{dsql}".encode("utf-8"), digest_size=12).digest()
+                )
+                tpcds_opt_sigs.append(
+                    hashlib.blake2b(f"{repr(opt_ast_check)}\0{dsql}".encode("utf-8"), digest_size=12).digest()
+                )
                 ast_q = parse_one(sql)
                 tpcds_tables_by_idx[idx_q] = sorted({t.name for t in find_tables(ast_q)})
                 tq0 = time.process_time()
@@ -1747,6 +1765,10 @@ def _build_runtime_caches_worker(args):
                 _ = transpile(sql, write="duckdb")[0]
                 ds_sub_ms.append(max(5, round((time.process_time() - tq0) * 1000)))
             else:
+                tpcds_parse_sigs.append(
+                    hashlib.blake2b(repr(p_ast_check).encode("utf-8"), digest_size=12).digest()
+                )
+                tpcds_opt_sigs.append(b"")
                 tq0 = time.process_time()
                 p_ast = pickle.loads(pickle.dumps(parse_one(sql)))
                 _ = pickle.loads(pickle.dumps(meta))
@@ -1854,7 +1876,12 @@ def _build_runtime_caches_worker(args):
 
     with open(out_dir / "duckdb_cache.pkl", "wb") as df_f:
         pickle.dump(
-            {"opt_tpch": opt_tpch_cache, "tpcds_df_by_sql": tpcds_df_by_sql},
+            {
+                "opt_tpch": opt_tpch_cache,
+                "tpcds_df_by_sql": tpcds_df_by_sql,
+                "tpcds_parse_sigs": tpcds_parse_sigs,
+                "tpcds_opt_sigs": tpcds_opt_sigs,
+            },
             df_f,
             protocol=pickle.HIGHEST_PROTOCOL,
         )

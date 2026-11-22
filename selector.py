@@ -2147,7 +2147,7 @@ def main() -> None:
         cpu_info_pre = dict(base_cpu_info)
         cpu_info_pre["heavy_preimported"] = True
 
-        raw_jobs: list[tuple[int, list, dict, dict, list, bool, bool]] = []
+        raw_jobs: list[tuple[int, list, dict, dict, list, bool, bool, list | None, bool]] = []
         exec_job_cnt = 0
         opt_job_cnt = 0
 
@@ -2158,7 +2158,16 @@ def main() -> None:
             overlay, ok = verifier.build_patch_overlay(patch_text, REF, parse_patch, apply_hunks)
             if not ok or not overlay:
                 continue
+            needs_clean = verifier.needs_clean_fork(overlay)
+            hot_actions = (
+                verifier.build_hot_patch_plan(overlay, REF, imported_from_file, ast_equal)
+                if needs_clean
+                else None
+            )
+            is_clean_fork = needs_clean and (hot_actions is None)
             can_lazy = verifier.can_lazy_executor(overlay)
+            oracle_tier = verifier.tpcds_oracle_tier(overlay, has_cache_file)
+            fast_max_nodes = verifier.can_fast_max_nodes(overlay)
             subtest_elig, has_work, priority = verifier.plan_commit_verification(
                 sel,
                 touch_info,
@@ -2169,6 +2178,9 @@ def main() -> None:
                 pack_cost_fn,
                 can_lazy,
                 has_cache_file,
+                is_clean_fork,
+                oracle_tier,
+                fast_max_nodes,
             )
             if not has_work:
                 continue
@@ -2179,7 +2191,19 @@ def main() -> None:
                 exec_job_cnt += 1
             if touches_opt:
                 opt_job_cnt += 1
-            raw_jobs.append((priority, entry, overlay, subtest_elig, all_cands, touches_exec, touches_opt))
+            raw_jobs.append(
+                (
+                    priority,
+                    entry,
+                    overlay,
+                    subtest_elig,
+                    all_cands,
+                    touches_exec,
+                    touches_opt,
+                    hot_actions,
+                    is_clean_fork,
+                )
+            )
 
         do_preimport = (exec_job_cnt >= 1) or ((exec_job_cnt + opt_job_cnt) >= 2)
         duckdb_cache = None
@@ -2202,14 +2226,31 @@ def main() -> None:
         cpu_info_active = dict(base_cpu_info)
         cpu_info_active["heavy_preimported"] = do_preimport
         has_duckdb_cache = bool(duckdb_cache and duckdb_cache.get("tpcds_df_by_sql"))
+        has_tpcds_sigs = bool(
+            duckdb_cache
+            and duckdb_cache.get("tpcds_parse_sigs")
+            and duckdb_cache.get("tpcds_opt_sigs")
+        )
 
-        clean_jobs: list[tuple[int, list, dict, dict, list]] = []
-        warm_jobs: list[tuple[int, list, dict, dict, list]] = []
+        clean_jobs: list[tuple[int, list, dict, dict, list, list | None, bool]] = []
+        warm_jobs: list[tuple[int, list, dict, dict, list, list | None, bool]] = []
 
-        for priority, entry, overlay, subtest_elig, all_cands, touches_exec, touches_opt in raw_jobs:
-            if not do_preimport and (touches_exec or touches_opt):
+        for (
+            priority,
+            entry,
+            overlay,
+            subtest_elig,
+            all_cands,
+            touches_exec,
+            touches_opt,
+            hot_actions,
+            is_clean_fork,
+        ) in raw_jobs:
+            if (not do_preimport or not has_tpcds_sigs) and (touches_exec or touches_opt):
                 _, sel, _, touch_info = entry
                 can_lazy = verifier.can_lazy_executor(overlay)
+                oracle_tier = verifier.tpcds_oracle_tier(overlay, has_tpcds_sigs)
+                fast_max_nodes = verifier.can_fast_max_nodes(overlay)
                 subtest_elig, has_work, priority = verifier.plan_commit_verification(
                     sel,
                     touch_info,
@@ -2220,11 +2261,14 @@ def main() -> None:
                     pack_cost_fn,
                     can_lazy,
                     has_duckdb_cache,
+                    is_clean_fork,
+                    oracle_tier,
+                    fast_max_nodes,
                 )
                 if not has_work:
                     continue
-            job = (priority, entry, overlay, subtest_elig, all_cands)
-            if verifier.needs_clean_fork(overlay):
+            job = (priority, entry, overlay, subtest_elig, all_cands, hot_actions, is_clean_fork)
+            if is_clean_fork:
                 clean_jobs.append(job)
             else:
                 warm_jobs.append(job)
@@ -2233,11 +2277,21 @@ def main() -> None:
         warm_jobs.sort(key=lambda x: -x[0])
 
         # Group A: Clean-fork BEFORE `import sqlglot`
-        for _, entry, overlay, subtest_elig, all_cands in clean_jobs:
+        for _, entry, overlay, subtest_elig, all_cands, hot_actions, is_clean_fork in clean_jobs:
             if verifier.get_children_cpu_seconds() >= max_verify_cpu_s or time.monotonic() >= wall_deadline:
                 break
             passed, _ = verifier.verify_commit_fork(
-                REF, overlay, subtest_elig, all_cands, cpu_info_active, duckdb_cache, pack_cost_fn, dur_ms, num_to_id
+                REF,
+                overlay,
+                subtest_elig,
+                all_cands,
+                cpu_info_active,
+                duckdb_cache,
+                pack_cost_fn,
+                dur_ms,
+                num_to_id,
+                hot_actions=hot_actions,
+                is_clean_fork=is_clean_fork,
             )
             if passed:
                 entry[1].difference_update(passed)
@@ -2252,11 +2306,21 @@ def main() -> None:
                     import sqlglot  # noqa: F401
             except BaseException:
                 pass
-            for _, entry, overlay, subtest_elig, all_cands in warm_jobs:
+            for _, entry, overlay, subtest_elig, all_cands, hot_actions, is_clean_fork in warm_jobs:
                 if verifier.get_children_cpu_seconds() >= max_verify_cpu_s or time.monotonic() >= wall_deadline:
                     break
                 passed, _ = verifier.verify_commit_fork(
-                    REF, overlay, subtest_elig, all_cands, cpu_info_active, duckdb_cache, pack_cost_fn, dur_ms, num_to_id
+                    REF,
+                    overlay,
+                    subtest_elig,
+                    all_cands,
+                    cpu_info_active,
+                    duckdb_cache,
+                    pack_cost_fn,
+                    dur_ms,
+                    num_to_id,
+                    hot_actions=hot_actions,
+                    is_clean_fork=is_clean_fork,
                 )
                 if passed:
                     entry[1].difference_update(passed)
